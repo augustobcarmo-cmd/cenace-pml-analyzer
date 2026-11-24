@@ -2521,10 +2521,12 @@ with st.sidebar:
             options=base + [c for c in seleccion_previa if c not in en_base],
             format_func=lambda c: etiquetas.get(c) or etiqueta_nodo(c, None),
             key="nodos_sel",
+            # «contains»: «Tast» da solo Tastiota y Maniobras Tastiota. El modo fuzzy de
+            # Streamlit devolvía ~980 coincidencias por subsecuencia en etiquetas largas.
+            filter_mode="contains",
             placeholder="Nombre, clave, zona o estado (p. ej. Tast)",
-            help=("Escribe parte del nombre, la clave, la zona o el estado: la lista sugiere los "
-                  "nodos que coinciden, ordenados por relevancia. Con una búsqueda escrita, "
-                  "«Select all» agrega todas las coincidencias."),
+            help=("Escribe parte del nombre, la clave, la zona o el estado: la lista muestra los "
+                  "nodos que lo contienen. «Select N matches» agrega todas las coincidencias."),
         )
         sel = st.session_state.get("nodos_sel", [])
         if sel:

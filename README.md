@@ -8,7 +8,7 @@ Es un fork de [CENACE PML Analyzer](https://github.com/sebasrf44/cenace-pml-anal
 
 ## Funcionalidades
 
-- **Buscador de nodos:** lista desplegable con todo el catálogo. Busca por nombre, clave, zona o estado (escribir «Tast» sugiere Tastiota y Maniobras Tastiota) con coincidencia aproximada ordenada por relevancia. Los filtros (sistema, estado, municipio, zona, CCR, kV) acotan la búsqueda.
+- **Buscador de nodos:** lista desplegable con todo el catálogo. Busca por nombre, clave, zona o estado: escribir «Tast» muestra Tastiota y Maniobras Tastiota, y «Select N matches» agrega todas las coincidencias. Los filtros (sistema, estado, municipio, zona, CCR, kV) acotan la búsqueda.
 - **Importar lista de claves** pegadas desde Excel y **listas guardadas** (`data/listas_nodos.json`).
 - **Enlaces para compartir:** cada consulta ejecutada deja su enlace (`?nodos=…&proceso=…&desde=…&hasta=…&moneda=…&modo=…`), que abre la app con todo precargado.
 - **Novedades del catálogo:** NodosP nuevos, bajas y cambios de la última versión, con botón para agregar los nuevos al buscador.
