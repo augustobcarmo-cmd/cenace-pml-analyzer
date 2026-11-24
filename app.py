@@ -218,8 +218,16 @@ def get_catalogo_activo():
 # ═══════════════════════════════════════════════════════════════════════
 # OSM CACHE
 # ═══════════════════════════════════════════════════════════════════════
-@st.cache_data(show_spinner=False, ttl=86400 * 7)
 def cargar_osm_subestaciones():
+    """Subestaciones de OSM; [] si Overpass no responde (el fallo no se guarda en caché)."""
+    try:
+        return _cargar_osm_subestaciones()
+    except RuntimeError:
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=86400 * 7)
+def _cargar_osm_subestaciones():
     osm_local = os.path.join(os.path.dirname(__file__), 'data', 'osm_subestaciones_mx.json')
     if os.path.exists(osm_local):
         with open(osm_local, 'r', encoding='utf-8') as f:
@@ -239,11 +247,12 @@ out center tags;
                          data={'data': query},
                          headers=OSM_HEADERS, timeout=200)
         if r.status_code != 200:
-            return []
-        data = r.json()
-        elementos = data.get('elements', [])
-    except Exception:
-        return []
+            raise RuntimeError(f"Overpass respondió {r.status_code}")
+        elementos = r.json().get('elements', [])
+    except Exception as e:   # sin caché: el próximo intento vuelve a consultar
+        raise RuntimeError(f"Overpass no respondió: {e}") from e
+    if not elementos:
+        raise RuntimeError("Overpass no devolvió subestaciones")
 
     def _parse_voltaje_max(v_raw):
         if not v_raw: return None

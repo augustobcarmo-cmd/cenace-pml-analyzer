@@ -187,3 +187,13 @@ def test_datos_excel(app):
     assert not any(re.search(r"bess", n, re.I) for n in nombres)
     rk = [wb["🏆 Rankings"].cell(row=r, column=1).value for r in range(1, wb["🏆 Rankings"].max_row + 1)]
     assert "🔻 Top horas negativas" in rk
+
+
+def test_fallo_de_openstreetmap_no_queda_en_cache(app):
+    def overpass_caido(url, data=None, headers=None, timeout=None, **kw):
+        raise ConnectionError("Overpass caído")
+    with mock.patch("requests.post", overpass_caido):
+        _consultar(app)
+    assert app.session_state["matches_df"] is None
+    _consultar(app)                       # Overpass vuelve: el mapa aparece
+    assert app.session_state["matches_df"]["lat"].notna().sum() == 3
