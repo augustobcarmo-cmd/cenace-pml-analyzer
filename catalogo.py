@@ -112,6 +112,12 @@ def versiones_publicadas(html, base=URL_PAGINA_CATALOGO):
     return sorted(vistos.items(), reverse=True)
 
 
+def _titulo(texto):
+    """'HERMOSILLO' → 'Hermosillo', pero las siglas sin vocales quedan igual ('VDM NORTE' → 'VDM Norte')."""
+    return " ".join(p if not re.search(r"[AEIOUÁÉÍÓÚ]", p.upper()) else p.capitalize()
+                    for p in texto.split())
+
+
 def etiqueta_nodo(clave, info):
     """Texto de cada opción del buscador: nombre · clave · kV · zona, estado · CCR."""
     if not info:
@@ -119,7 +125,7 @@ def etiqueta_nodo(clave, info):
     partes = [info.get("nombre") or clave, clave]
     if info.get("kv"):
         partes.append(f"{info['kv']} kV")
-    lugar = ", ".join(x.title() for x in (info.get("zona"), info.get("estado")) if x)
+    lugar = ", ".join(_titulo(x) for x in (info.get("zona"), info.get("estado")) if x)
     if lugar:
         partes.append(lugar)
     if info.get("ccr"):
