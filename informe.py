@@ -227,9 +227,12 @@ def ficha(df: pd.DataFrame, umbral: float = UMBRAL_CNG_MXN, unidad: str = "MXN")
 
 
 # ─── Lecturas automáticas ────────────────────────────────────────────────
-def _n(x, dec=0) -> str:
+def _n(x, dec=None) -> str:
+    """Miles con coma; sin decimales salvo valores chicos (USD, pérdidas, congestión)."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
+    if dec is None:
+        dec = 1 if abs(x) < 100 else 0
     return f"{x:,.{dec}f}"
 
 
@@ -473,6 +476,6 @@ def lecturas_comparacion(comp: dict, nombres: dict, unidad: str = "MXN") -> list
             out.append(f"**Correlación diaria.** El par menos correlacionado es {a} / {b} "
                        f"(r = {m.min():.2f}): ahí está el mayor riesgo de base entre nodos.")
         elif len(m):
-            out.append(f"**Correlación diaria.** Los promedios diarios se mueven juntos (r ≥ {m.min():.2f} en todos "
-                       f"los pares): la diferencia entre nodos está en las horas, no en el nivel del día.")
+            out.append(f"**Correlación diaria.** Los promedios diarios se mueven juntos (r mínimo {m.min():.2f}): la "
+                       f"diferencia entre nodos está en las horas, no en el nivel del día.")
     return out
