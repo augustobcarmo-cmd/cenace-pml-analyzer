@@ -1,0 +1,97 @@
+{
+ "version": "v2026-11-18",
+ "version_anterior": "v2026-07-16",
+ "revisado": "2026-11-24T14:07:16+00:00",
+ "fuente": "https://www.cenace.gob.mx/Docs/01_MECP/CatalogoNodosP/2026/Cat%C3%A1logo%20NodosP%20Sistema%20El%C3%A9ctrico%20Nacional%20(v2026-11-18).xlsx",
+ "nodos": 2615,
+ "altas": [
+  {
+   "clave": "01VMA-230",
+   "sistema": "SIN",
+   "ccr": "CENTRAL",
+   "zona": "VDM NORTE",
+   "nombre": "Valle de Mexico Maniobras",
+   "kv": 230,
+   "estado": "MEXICO",
+   "municipio": "AXAPUSCO"
+  },
+  {
+   "clave": "01VMA-AGR",
+   "sistema": "SIN",
+   "ccr": "CENTRAL",
+   "zona": "VDM NORTE",
+   "nombre": "Valle de Mexico Maniobras",
+   "kv": 0,
+   "estado": "MEXICO",
+   "municipio": "AXAPUSCO"
+  },
+  {
+   "clave": "01VSP-230",
+   "sistema": "SIN",
+   "ccr": "CENTRAL",
+   "zona": "VDM NORTE",
+   "nombre": "Valle de San Pedro",
+   "kv": 230,
+   "estado": "MEXICO",
+   "municipio": "TECAMAC"
+  },
+  {
+   "clave": "03MPK-115",
+   "sistema": "SIN",
+   "ccr": "OCCIDENTAL",
+   "zona": "AGUASCALIENTES",
+   "nombre": "Maniobras Vesta Park Aguascalientes",
+   "kv": 115,
+   "estado": "AGUASCALIENTES",
+   "municipio": "AGUASCALIENTES"
+  },
+  {
+   "clave": "03PSM-230",
+   "sistema": "SIN",
+   "ccr": "OCCIDENTAL",
+   "zona": "QUERETARO",
+   "nombre": "Pesma Dos Maniobras",
+   "kv": 230,
+   "estado": "GUANAJUATO",
+   "municipio": "SAN MIGUEL DE ALLENDE"
+  },
+  {
+   "clave": "03TLJ-230",
+   "sistema": "SIN",
+   "ccr": "OCCIDENTAL",
+   "zona": "GUADALAJARA",
+   "nombre": "Tlajomulco",
+   "kv": 230,
+   "estado": "JALISCO",
+   "municipio": "TLAJOMULCO DE ZUÑIGA"
+  }
+ ],
+ "bajas": [],
+ "cambios": [],
+ "control_de_cambios": [
+  {
+   "numero": "163",
+   "descripcion": "Sin cambios relevantes respecto al catalogo del mes anterior",
+   "version": "2026-08-19",
+   "responsable": "Unidad de Soporte de la Operación (USO)"
+  },
+  {
+   "numero": "164",
+   "descripcion": "Alta del nuevo NodoP 03TLJ-230",
+   "version": "2026-09-23",
+   "responsable": "Unidad de Soporte de la Operación (USO)"
+  },
+  {
+   "numero": "165",
+   "descripcion": "Alta del nuevo NodoP 03MPK-115",
+   "version": "2026-10-23",
+   "responsable": "Unidad de Soporte de la Operación (USO)"
+  },
+  {
+   "numero": "166",
+   "descripcion": "Alta de los nuevos NodosP 01VSP-230, 01VMA-230, 01VMA-AGR y 03PSM-230",
+   "version": "2026-11-18",
+   "responsable": "Unidad de Soporte de la Operación (USO)"
+  }
+ ]
+}
