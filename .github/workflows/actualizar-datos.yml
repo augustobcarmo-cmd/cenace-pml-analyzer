@@ -1,0 +1,77 @@
+name: Actualizar historial de PML (MTR)
+
+# Guarda en la rama `datos` el historial completo de PML MTR de los nodos de las
+# listas guardadas (data/listas_nodos.json). La primera vez descarga todo desde el
+# 27-ene-2017; después solo los días nuevos. La rama se publica como un único
+# commit sin historial, para que el repositorio no crezca.
+on:
+  schedule:
+    - cron: "37 15 * * *"   # 9:37 en CDMX
+    - cron: "37 23 * * *"   # 17:37 en CDMX
+  workflow_dispatch:
+    inputs:
+      nodos:
+        description: "Claves extra, separadas por coma (opcional)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - data/listas_nodos.json
+      - datos_pml.py
+      - scripts/actualizar_datos.py
+      - .github/workflows/actualizar-datos.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-datos
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Traer la rama datos
+        id: rama
+        uses: actions/checkout@v4
+        continue-on-error: true    # la primera vez no existe
+        with:
+          ref: datos
+          path: datos_rama
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependencias
+        run: pip install requests==2.34.2 pandas==3.1.1 pyarrow==26.0.1 openpyxl==3.1.5
+
+      - name: Descargar lo que falta
+        id: datos
+        env:
+          NODOS_EXTRA: ${{ inputs.nodos }}
+        run: |
+          mkdir -p datos_rama
+          python scripts/actualizar_datos.py --destino datos_rama --nodos "$NODOS_EXTRA" --max-minutos 240
+
+      - name: Publicar la rama datos
+        if: steps.datos.outputs.cambios == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HASTA: ${{ steps.datos.outputs.hasta }}
+          RESUMEN: ${{ steps.datos.outputs.resumen }}
+        run: |
+          cd datos_rama
+          rm -rf .git
+          git init -q
+          git checkout -q -b datos
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "PML MTR hasta $HASTA" -m "$RESUMEN"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" datos

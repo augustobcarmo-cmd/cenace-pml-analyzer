@@ -10,7 +10,8 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import catalogo as cat
-from test_app import APP, fake_requests_get, fake_requests_post, fake_session_get, _boton
+import cenace_falso as cf
+from test_app import APP
 
 RAIZ = Path(APP).parent
 CAMBIOS = RAIZ / "data" / "catalogo_cambios.json"
@@ -18,12 +19,17 @@ CAMBIOS = RAIZ / "data" / "catalogo_cambios.json"
 
 @pytest.fixture()
 def app():
-    with mock.patch("requests.Session.get", fake_session_get), \
-         mock.patch("requests.get", fake_requests_get), \
-         mock.patch("requests.post", fake_requests_post):
+    with mock.patch("requests.Session.get", cf.session_get), \
+         mock.patch("requests.get", cf.requests_get), \
+         mock.patch("requests.post", cf.requests_post):
         st.cache_data.clear()
+        st.cache_resource.clear()
         at = AppTest.from_file(APP, default_timeout=180)
         yield at
+
+
+def _boton(at, etiqueta):
+    return next(b for b in at.button if b.label == etiqueta)
 
 
 # ─── catalogo.py ───
@@ -62,7 +68,8 @@ def test_buscador_ofrece_todo_el_catalogo_con_etiquetas(app):
     app.run()
     ms = app.multiselect(key="nodos_sel")
     assert len(ms.options) > 2000
-    assert "Tastiota · 04TST-115 · 115 kV · Hermosillo, Sonora · NOROESTE" in ms.options
+    # 💾 = historial guardado en la rama datos (en la prueba, solo 04TST-115)
+    assert "💾 Tastiota · 04TST-115 · 115 kV · Hermosillo, Sonora · NOROESTE" in ms.options
     assert "Maniobras Tastiota · 04MTS-115 · 115 kV · Hermosillo, Sonora · NOROESTE" in ms.options
 
 
@@ -92,24 +99,6 @@ def test_lista_guardada(app):
     next(b for b in app.button if b.key == "btn_lista_add").click()
     app.run()
     assert app.session_state["nodos_sel"] == ["04TST-115", "04MTS-115", "04EMY-115"]
-
-
-def test_enlace_precarga_y_se_actualiza_al_ejecutar(app):
-    app.query_params["nodos"] = "04TST-115,04EMY-115"
-    app.query_params["proceso"] = "MDA"
-    app.query_params["desde"] = "2026-01-05"
-    app.query_params["hasta"] = "2026-01-11"
-    app.query_params["modo"] = "datos"
-    app.run()
-    assert app.session_state["nodos_sel"] == ["04TST-115", "04EMY-115"]
-    assert app.selectbox(key="proceso_sel").value == "MDA"
-    assert str(app.date_input(key="f_ini").value) == "2026-01-05"
-    assert app.radio(key="modo_sel").value == "📊 Datos"
-    _boton(app, "⚡ Ejecutar").click()
-    app.run()
-    assert not app.exception, [e.message for e in app.exception]
-    assert app.query_params["nodos"] == ["04TST-115,04EMY-115"] or app.query_params["nodos"] == "04TST-115,04EMY-115"
-    assert any("nodos=04TST-115%2C04EMY-115" in c.value and "proceso=MDA" in c.value for c in app.code)
 
 
 def test_novedades_del_catalogo(app):

@@ -1,199 +1,271 @@
-"""Prueba de humo de la app con el CENACE, Banxico y OpenStreetMap simulados.
+"""App completa con el CENACE, Banxico, DOF, GitHub y OpenStreetMap simulados.
 
-    pytest -q tests
+    python -m pytest -q tests
 
-Recorre el modo Análisis (MXN y USD) y el modo Datos (Excel de datos y de
-análisis) y verifica que no quede nada de BESS ni de KMZ.
+Un nodo con historial guardado (04TST-115) sale sin consultar al CENACE; los demás
+se descargan (12 meses y luego todo el historial). Se revisan la ficha, la
+comparación, el período, la conversión a USD con el FIX de cada día, los enlaces y el
+mapa.
 """
-import io
-import json
-import math
 import re
 from datetime import date, timedelta
 from pathlib import Path
+from statistics import mean
 from unittest import mock
 
-import openpyxl
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+import cenace_falso as cf
+import datos_pml as dp
+
 APP = str(Path(__file__).resolve().parents[1] / "app.py")
-
-# SIN (Central, Noroeste, Noreste) + BCA, para probar multi-sistema y spread por CCR
-NODOS = ["01AAN-85", "04TST-115", "06MTP-115", "07RIN-161"]
-F_INI, F_FIN = date(2025, 12, 20), date(2026, 1, 12)   # cruza de año: multi-año
-
-OSM = {"elements": [
-    {"type": "node", "id": 1, "lat": 20.27, "lon": -98.94,
-     "tags": {"power": "substation", "name": "Actopan", "voltage": "85000"}},
-    {"type": "node", "id": 2, "lat": 28.37, "lon": -111.42,
-     "tags": {"power": "substation", "name": "Tastiota", "voltage": "115000"}},
-    {"type": "node", "id": 3, "lat": 25.73, "lon": -100.28,
-     "tags": {"power": "substation", "name": "Monterrey Potencia", "voltage": "115000"}},
-]}
+NODOS = ["04TST-115", "04EMY-115", "06MTP-115"]
 
 
-class _Resp:
-    def __init__(self, status=200, text="", payload=None):
-        self.status_code = status
-        self.text = text if payload is None else json.dumps(payload)
-        self._payload = payload
-
-    def json(self):
-        return self._payload if self._payload is not None else json.loads(self.text)
+def _parches(get=cf.requests_get, post=cf.requests_post):
+    return (mock.patch("requests.Session.get", cf.session_get), mock.patch("requests.get", get),
+            mock.patch("requests.post", post))
 
 
-def _pml(nodo, dia, hora):
-    """PML sintético: perfil diario, nivel por nodo y algunas horas negativas."""
-    base = 900 + 150 * (sum(map(ord, nodo)) % 7)
-    v = base + 400 * math.sin((hora - 6) / 24 * 2 * math.pi) + 10 * dia.day
-    return round(v - 2000 if (hora in (12, 13) and dia.day % 5 == 0) else v, 2)
-
-
-def fake_session_get(self, url, timeout=None, **kw):
-    m = re.search(r"/SIM/(\w+)/(\w+)/([^/]+)/(\d{4})/(\d{2})/(\d{2})/(\d{4})/(\d{2})/(\d{2})/JSON$", url)
-    assert m, url
-    nodos = m.group(3).split(",")
-    assert len(nodos) <= 20
-    d0 = date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
-    d1 = date(int(m.group(7)), int(m.group(8)), int(m.group(9)))
-    assert 1 <= (d1 - d0).days + 1 <= 7
-    resultados = []
-    for n in nodos:
-        valores, d = [], d0
-        while d <= d1:
-            for h in range(1, 25):
-                p = _pml(n, d, h)
-                valores.append({"fecha": d.isoformat(), "hora": str(h), "pml": f"{p:.2f}",
-                                "pml_ene": f"{p * 0.95:.2f}", "pml_per": f"{p * 0.03:.2f}",
-                                "pml_cng": f"{p * 0.02:.2f}"})
-            d += timedelta(days=1)
-        resultados.append({"clv_nodo": n, "Valores": valores})
-    return _Resp(200, payload={"nombre": "PML", "proceso": m.group(2),
-                               "sistema": m.group(1), "Resultados": resultados})
-
-
-def fake_requests_get(url, headers=None, timeout=None, **kw):
-    assert "banxico" in url
-    datos, d = [], F_INI - timedelta(days=5)
-    while d <= F_FIN:
-        if d.weekday() < 5:
-            datos.append({"fecha": d.strftime("%d/%m/%Y"), "dato": "18.5000"})
-        d += timedelta(days=1)
-    return _Resp(200, payload={"bmx": {"series": [{"idSerie": "SF43718", "datos": datos}]}})
-
-
-def fake_requests_post(url, data=None, headers=None, timeout=None, **kw):
-    assert "overpass" in url
-    return _Resp(200, payload=OSM)
+def nueva_app(token=True, query=None):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    at = AppTest.from_file(APP, default_timeout=600)
+    if token:
+        at.secrets["BANXICO_TOKEN"] = "token-de-prueba"
+    for k, v in (query or {}).items():
+        at.query_params[k] = v
+    at.run()
+    return at
 
 
 @pytest.fixture()
 def app():
-    with mock.patch("requests.Session.get", fake_session_get), \
-         mock.patch("requests.get", fake_requests_get), \
-         mock.patch("requests.post", fake_requests_post):
-        st.cache_data.clear()
-        at = AppTest.from_file(APP, default_timeout=180)
-        at.secrets["BANXICO_TOKEN"] = "token-de-prueba"
-        at.run()
-        yield at
+    p1, p2, p3 = _parches()
+    with p1, p2, p3:
+        yield nueva_app()
 
 
-def _boton(at, etiqueta):
-    return next(b for b in at.button if b.label == etiqueta)
+def boton(at, key):
+    return next(b for b in at.button if b.key == key)
 
 
-def _radio(at, etiqueta):
-    return next(r for r in at.radio if r.label == etiqueta)
-
-
-def _consultar(at):
-    at.multiselect(key="nodos_sel").set_value(NODOS)
-    at.date_input(key="f_ini").set_value(F_INI)
-    at.date_input(key="f_fin").set_value(F_FIN)
+def generar(at, nodos):
+    at.multiselect(key="nodos_sel").set_value(nodos)
     at.run()
-    _boton(at, "⚡ Ejecutar").click()
+    cf.LLAMADAS["cenace"] = 0
+    boton(at, "btn_generar").click()
     at.run()
+    sin_errores(at)
+
+
+def sin_errores(at):
     assert not at.exception, [e.message for e in at.exception]
 
 
-def _textos(at):
+def textos(at):
     partes = [m.value for m in at.markdown] + [c.value for c in at.caption]
-    partes += [i.value for i in at.info] + [w.value for w in at.warning]
+    partes += [i.value for i in at.info] + [w.value for w in at.warning] + [e.value for e in at.error]
     return "\n".join(str(p) for p in partes)
 
 
-def test_portada_sin_bess(app):
-    assert not app.exception
-    assert "PML CENACE" in _textos(app)
+def metrica(at, etiqueta):
+    valor = next(m.value for m in at.metric if m.label == etiqueta)
+    return float(re.sub(r"[^0-9.\-]", "", str(valor)))
+
+
+def periodo_mostrado(at):
+    cap = next(c.value for c in at.caption if c.value.startswith("MTR ·"))
+    d0, d1 = re.search(r"(\d{2}-\d{2}-\d{4}) a (\d{2}-\d{2}-\d{4})", cap).groups()
+    conv = lambda s: date(int(s[6:]), int(s[3:5]), int(s[:2]))          # noqa: E731
+    return conv(d0), conv(d1)
+
+
+def tabla_anual(at):
+    return next(d.value for d in at.dataframe if "anio" in d.value.columns)
+
+
+def test_portada_sin_modos_proceso_ni_subida_de_catalogo(app):
+    sin_errores(app)
+    claves_widgets = {w.key for w in app.radio} | {w.key for w in app.selectbox}
+    assert not {"modo_sel", "proceso_sel"} & claves_widgets
+    assert not app.get("file_uploader")
     from catalogo import parse_catalogo
     version = parse_catalogo(Path(APP).parent / "data" / "catalogo_nodos.xlsx")[1]
-    assert version and version in _textos(app)
-    assert _radio(app, "Selecciona qué hacer:").options == ["🔬 Análisis", "📊 Datos"]
-    assert not re.search(r"bess|kmz|scoring", _textos(app), re.I)
+    t = textos(app)
+    assert version in t and "Generar informe" in t and "Tastiota (04TST-115)" in t
+    assert not re.search(r"kmz|scoring|modo de uso|actualizar catálogo", t, re.I)
 
 
-def test_analisis_mxn(app):
-    _consultar(app)
-    acumulado = app.session_state["acumulado"]
-    assert set(acumulado) == set(NODOS)
-    for filas in acumulado.values():          # 24 días × 24 horas, ordenados
-        assert len(filas) == 24 * 24
-        claves = [(f["fecha"], f["hora"]) for f in filas]
-        assert claves == sorted(claves)
-    params = app.session_state["consulta_params"]
-    assert params["sistema"] == "MULTI" and params["info_sistemas"] == {"SIN": 3, "BCA": 1}
-    matches = app.session_state["matches_df"]
-    assert matches["lat"].notna().sum() == 3     # 07RIN-161 queda sin ubicar
-    labels = [m.label for m in app.metric]
-    assert "PML promedio global" in labels and "Ubicados" in labels
-    assert not re.search(r"bess|scoring", _textos(app), re.I)
+def test_ficha_de_nodo_guardado_sale_sin_consultar_al_cenace(app):
+    generar(app, ["04TST-115"])
+    assert cf.LLAMADAS["cenace"] == 0
+    assert periodo_mostrado(app) == (dp.INICIO_MTR, dp.ultimo_dia_mtr())
+    esperado = cf.pml_esperado("04TST-115", dp.INICIO_MTR, dp.ultimo_dia_mtr())
+    assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)
+    assert [t.label for t in app.tabs][:5] == ["📌 Lecturas", "📈 Historia", "🔌 Congestión y pérdidas",
+                                               "🕐 Distribuciones", "☀️🔋 Solar y baterías"]
+    t = textos(app)
+    for palabra in ("**Nivel.**", "**Red.**", "zona exportadora", "**Solar.**", "**Baterías.**"):
+        assert palabra in t, palabra
+    anual = tabla_anual(app)
+    assert list(anual["anio"]) == [str(a) for a in range(2017, dp.ultimo_dia_mtr().year + 1)]
+    assert [d.label for d in app.get("download_button")][0] == "📑 Informe (Excel)"
+    assert not any(b.key in ("btn_anio", "btn_todo") for b in app.button)
 
 
-def test_analisis_usd(app):
-    _radio(app, "Moneda:").set_value("🇺🇸 USD (dólares)")
-    _consultar(app)
-    fx = app.session_state["fx_info"]
-    assert fx["moneda"] == "USD" and abs(fx["tc_promedio"] - 18.5) < 1e-9
-    assert "Análisis en USD" in _textos(app)
-
-
-def test_datos_excel(app):
-    _consultar(app)
-    _radio(app, "Selecciona qué hacer:").set_value("📊 Datos")
+def test_nodo_sin_historial_baja_12_meses_y_luego_todo(app):
+    generar(app, ["06MTP-115"])
+    ultimo = dp.ultimo_dia_mtr()
+    assert cf.LLAMADAS["cenace"] == len(dp.bloques(ultimo - timedelta(days=364), ultimo, ultimo))
+    d0, d1 = periodo_mostrado(app)
+    assert d1 == ultimo and timedelta(days=364) <= d1 - d0 <= timedelta(days=371)
+    assert "Historial parcial" in textos(app)
+    cf.LLAMADAS["cenace"] = 0
+    boton(app, "btn_todo").click()
     app.run()
-    assert not app.exception, [e.message for e in app.exception]
-    assert "Centro de descargas" in _textos(app)
+    sin_errores(app)
+    assert periodo_mostrado(app) == (dp.INICIO_MTR, ultimo)
+    assert cf.LLAMADAS["cenace"] == len(dp.bloques(dp.INICIO_MTR, d0 - timedelta(days=1), ultimo))
+    assert not any(b.key in ("btn_anio", "btn_todo") for b in app.button)
+    esperado = cf.pml_esperado("06MTP-115", dp.INICIO_MTR, ultimo)
+    assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)
 
-    _boton(app, "⚡ Generar Excel de Datos").click()
+
+def test_comparacion_periodo_comun_y_ficha_de_cada_nodo(app):
+    generar(app, NODOS)
+    assert app.radio(key="vista_sel").options == ["📊 Comparación", "Tastiota (04TST-115)", "El Mayo (04EMY-115)",
+                                                  "Monterrey Potencia (06MTP-115)"]
+    tabla = next(d.value for d in app.dataframe if "solar_factor" in d.value.columns)
+    assert list(tabla.index) == NODOS
+    assert "Ojo con los períodos" in textos(app)
+    app.radio(key="periodo_modo").set_value("comun")
     app.run()
-    _boton(app, "⚡ Generar Excel de Análisis").click()
+    sin_errores(app)
+    ultimo = dp.ultimo_dia_mtr()
+    inicio_mtp = dp.bloques(ultimo - timedelta(days=364), ultimo, ultimo)[0][0]   # 12 meses descargados
+    assert periodo_mostrado(app) == (max(cf.INICIO_NODO["04EMY-115"], inicio_mtp), ultimo)
+    assert "Ojo con los períodos" not in textos(app)
+    app.selectbox(key="ref_sel").set_value("06MTP-115")
     app.run()
-    assert not app.exception, [e.message for e in app.exception]
+    assert "04TST-115 − 06MTP-115" in textos(app)
+    app.radio(key="vista_sel").set_value("04EMY-115")
+    app.run()
+    sin_errores(app)
+    esperado = cf.pml_esperado("04EMY-115", max(cf.INICIO_NODO["04EMY-115"], inicio_mtp), ultimo)
+    assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)   # período común
 
-    wb = openpyxl.load_workbook(io.BytesIO(app.session_state["excel_datos_bytes"]))
-    assert wb.sheetnames[:2] == ["■ Portada", "Resumen"] and set(NODOS) <= set(wb.sheetnames)
-    ws = wb["04TST-115"]
-    fechas = [ws.cell(row=r, column=1).value for r in range(4, ws.max_row + 1)]
-    assert fechas[0] == F_INI.isoformat() and fechas[-1] == F_FIN.isoformat()
-    assert isinstance(wb["Resumen"].cell(row=3, column=3).value, float)
 
-    wb = openpyxl.load_workbook(io.BytesIO(app.session_state["excel_analisis_bytes"]))
-    nombres = wb.sheetnames
-    assert {"■ Portada", "📊 Resumen", "🏆 Rankings", "📊 Spread CCR"} <= set(nombres)
-    assert sum(n.startswith("📈 ") for n in nombres) == len(NODOS)   # multi-año
-    assert not any(re.search(r"bess", n, re.I) for n in nombres)
-    rk = [wb["🏆 Rankings"].cell(row=r, column=1).value for r in range(1, wb["🏆 Rankings"].max_row + 1)]
-    assert "🔻 Top horas negativas" in rk
+def _usd_en_periodo(at, d0, d1):
+    at.radio(key="moneda_sel").set_value("🇺🇸 USD (dólares)")
+    at.radio(key="periodo_modo").set_value("pers")
+    at.run()
+    at.date_input(key="periodo_rango").set_value((d0, d1))
+    at.run()
+    sin_errores(at)
+    return tabla_anual(at).set_index("anio")["promedio"]
+
+
+def _esperado_usd(nodo, d0, d1):
+    return mean(cf.componentes(nodo, d, h)[0] / cf.fix_aplicable(d)
+                for d in (d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)) for h in range(1, 25))
+
+
+def test_usd_con_el_fix_de_cada_dia_fines_de_semana_y_feriados(app):
+    generar(app, ["04TST-115"])
+    d0, d1 = date(2025, 12, 26), date(2026, 1, 8)            # fin de semana y feriado del 1-ene
+    prom = _usd_en_periodo(app, d0, d1)
+    assert prom["2025"] == pytest.approx(_esperado_usd("04TST-115", d0, date(2025, 12, 31)), rel=1e-9)
+    assert prom["2026"] == pytest.approx(_esperado_usd("04TST-115", date(2026, 1, 1), d1), rel=1e-9)
+    assert "Banxico SIE" in textos(app)
+
+
+def test_usd_sin_token_usa_el_dof_con_los_mismos_valores():
+    p1, p2, p3 = _parches()
+    with p1, p2, p3:
+        at = nueva_app(token=False)
+        generar(at, ["04TST-115"])
+        d0, d1 = date(2025, 12, 26), date(2026, 1, 8)
+        prom = _usd_en_periodo(at, d0, d1)
+        assert prom["2026"] == pytest.approx(_esperado_usd("04TST-115", date(2026, 1, 1), d1), rel=1e-9)
+        assert "DOF (SIDOF)" in textos(at)
+
+
+def test_sin_tipo_de_cambio_avisa_y_queda_en_mxn():
+    def solo_github(url, headers=None, timeout=None, **kw):
+        if "raw.githubusercontent.com" in url:
+            return cf.github_get(url)
+        raise ConnectionError("sin red")
+    p1, p2, p3 = _parches(get=solo_github)
+    with p1, p2, p3:
+        at = nueva_app()
+        generar(at, ["04TST-115"])
+        at.radio(key="moneda_sel").set_value("🇺🇸 USD (dólares)")
+        at.run()
+        sin_errores(at)
+        assert any("No se pudo obtener el tipo de cambio" in e.value for e in at.error)
+        assert any(m.label == "PML promedio (MXN/MWh)" for m in at.metric)
+
+
+def test_enlace_genera_el_informe_con_moneda_y_periodo():
+    p1, p2, p3 = _parches()
+    with p1, p2, p3:
+        anio = dp.ultimo_dia_mtr().year - 1
+        at = nueva_app(query={"nodos": "04TST-115,06MTP-115", "moneda": "USD", "periodo": str(anio)})
+        sin_errores(at)
+        assert at.session_state["nodos_sel"] == ["04TST-115", "06MTP-115"]
+        assert periodo_mostrado(at) == (date(anio, 1, 1), date(anio, 12, 31))
+        assert any(m.label.endswith("(USD/MWh)") for m in at.metric) or "USD/MWh" in textos(at)
+        assert any(f"periodo={anio}" in c.value and "moneda=USD" in c.value for c in at.code)
+
+
+def test_enlace_de_la_version_anterior_respeta_las_fechas():
+    p1, p2, p3 = _parches()
+    with p1, p2, p3:
+        at = nueva_app(query={"nodos": "04TST-115", "proceso": "MDA", "modo": "datos",
+                              "desde": "2026-01-05", "hasta": "2026-01-11"})
+        sin_errores(at)
+        assert periodo_mostrado(at) == (date(2026, 1, 5), date(2026, 1, 11))
+        assert at.query_params["periodo"] in (["2026-01-05_2026-01-11"], "2026-01-05_2026-01-11")
+
+
+def test_reinicio_de_la_app_recupera_el_historial_guardado(app):
+    generar(app, ["04TST-115", "06MTP-115"])
+    st.cache_resource.clear()                                  # la app se durmió: memoria vacía
+    app.run()
+    assert "ya no están en memoria" in textos(app)              # 06MTP-115 no estaba guardado
+    app.multiselect(key="nodos_sel").set_value(["04TST-115"])
+    boton(app, "btn_generar").click()
+    app.run()
+    st.cache_resource.clear()
+    app.run()
+    sin_errores(app)
+    assert "ya no están en memoria" not in textos(app) and any(m.label.startswith("PML promedio") for m in app.metric)
+
+
+def test_seleccion_cambiada_y_limpiar_todo(app):
+    generar(app, ["04TST-115"])
+    app.multiselect(key="nodos_sel").set_value(["04TST-115", "04MTS-115"])
+    app.run()
+    assert "La selección cambió" in textos(app)
+    boton(app, "btn_clear_all").click()
+    app.run()
+    sin_errores(app)
+    assert app.session_state["nodos_sel"] == [] and "informe" not in app.session_state
 
 
 def test_fallo_de_openstreetmap_no_queda_en_cache(app):
     def overpass_caido(url, data=None, headers=None, timeout=None, **kw):
         raise ConnectionError("Overpass caído")
+    generar(app, ["04TST-115", "01AAN-85"])
     with mock.patch("requests.post", overpass_caido):
-        _consultar(app)
-    assert app.session_state["matches_df"] is None
-    _consultar(app)                       # Overpass vuelve: el mapa aparece
-    assert app.session_state["matches_df"]["lat"].notna().sum() == 3
+        boton(app, "btn_ubicar").click()
+        app.run()
+    assert app.session_state["ubicaciones"] is None and "OpenStreetMap no respondió" in textos(app)
+    boton(app, "btn_ubicar").click()
+    app.run()
+    sin_errores(app)
+    ub = app.session_state["ubicaciones"]["df"].set_index("clave")
+    assert ub.loc["04TST-115", "lat"] == pytest.approx(28.37) and ub.loc["01AAN-85", "lat"] == pytest.approx(20.27)
