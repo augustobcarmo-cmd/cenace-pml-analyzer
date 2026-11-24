@@ -15,6 +15,7 @@ from unittest import mock
 
 import openpyxl
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 APP = str(Path(__file__).resolve().parents[1] / "app.py")
@@ -93,6 +94,7 @@ def app():
     with mock.patch("requests.Session.get", fake_session_get), \
          mock.patch("requests.get", fake_requests_get), \
          mock.patch("requests.post", fake_requests_post):
+        st.cache_data.clear()
         at = AppTest.from_file(APP, default_timeout=180)
         at.secrets["BANXICO_TOKEN"] = "token-de-prueba"
         at.run()
@@ -108,7 +110,7 @@ def _radio(at, etiqueta):
 
 
 def _consultar(at):
-    at.text_area(key="nodos_input").set_value("\n".join(NODOS))
+    at.multiselect(key="nodos_sel").set_value(NODOS)
     at.date_input(key="f_ini").set_value(F_INI)
     at.date_input(key="f_fin").set_value(F_FIN)
     at.run()

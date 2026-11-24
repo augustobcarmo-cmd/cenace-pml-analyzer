@@ -13,6 +13,7 @@ from unittest import mock
 
 import openpyxl
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from test_app import APP, NODOS, _Resp, _boton, _radio, fake_requests_post
@@ -52,7 +53,30 @@ def fake_session_get(self, url, timeout=None, **kw):
     return _Resp(200, payload={"Resultados": resultados})
 
 
+def _habil(d):
+    return d.weekday() < 5 and d not in FERIADOS
+
+
+def fake_sidof(url):
+    """DOF: publica el FIX de cada día hábil el siguiente día hábil."""
+    m = re.search(r"/indicadores/158/(\d{2})-(\d{2})-(\d{4})/(\d{2})-(\d{2})-(\d{4})$", url)
+    d0 = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    d1 = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    lista = []
+    for d in _dias(d0 - timedelta(days=10), d1):
+        if not _habil(d):
+            continue
+        pub = d + timedelta(days=1)
+        while not _habil(pub):
+            pub += timedelta(days=1)
+        if d0 <= pub <= d1:
+            lista.append({"codTipoIndicador": 158, "fecha": pub.strftime("%d-%m-%Y"), "valor": f"{_fix(d):.4f}"})
+    return _Resp(200, payload={"messageCode": 200, "ListaIndicadores": lista})
+
+
 def fake_requests_get(url, headers=None, timeout=None, **kw):
+    if "sidof" in url:
+        return fake_sidof(url)
     m = re.search(r"/datos/(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})", url)
     d0, d1 = date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))
     datos = [{"fecha": d.strftime("%d/%m/%Y"), "dato": f"{_fix(d):.4f}"}
@@ -60,11 +84,21 @@ def fake_requests_get(url, headers=None, timeout=None, **kw):
     return _Resp(200, payload={"bmx": {"series": [{"idSerie": "SF43718", "datos": datos}]}})
 
 
+def _nueva_app(token=True):
+    st.cache_data.clear()
+    at = AppTest.from_file(APP, default_timeout=180)
+    if token:
+        at.secrets["BANXICO_TOKEN"] = "token-de-prueba"
+    at.run()
+    return at
+
+
 @pytest.fixture()
 def app():
     with mock.patch("requests.Session.get", fake_session_get), \
          mock.patch("requests.get", fake_requests_get), \
          mock.patch("requests.post", fake_requests_post):
+        st.cache_data.clear()
         at = AppTest.from_file(APP, default_timeout=180)
         at.secrets["BANXICO_TOKEN"] = "token-de-prueba"
         at.run()
@@ -72,7 +106,7 @@ def app():
 
 
 def _consultar(at, f_ini=F_INI, f_fin=F_FIN):
-    at.text_area(key="nodos_input").set_value("\n".join(NODOS))
+    at.multiselect(key="nodos_sel").set_value(NODOS)
     at.date_input(key="f_ini").set_value(f_ini)
     at.date_input(key="f_fin").set_value(f_fin)
     at.run()
@@ -131,3 +165,31 @@ def test_consulta_nueva_del_mismo_largo_no_reutiliza_la_anterior(app):
     otra_ini, otra_fin = date(2026, 3, 2), date(2026, 3, 15)  # 14 días: marzo
     _consultar(app, otra_ini, otra_fin)
     assert abs(_kpi(app, "PML promedio global") - _promedio(otra_ini, otra_fin)) < 0.01
+
+
+def test_usd_sin_token_usa_el_dof_con_los_mismos_valores():
+    with mock.patch("requests.Session.get", fake_session_get), \
+         mock.patch("requests.get", fake_requests_get), \
+         mock.patch("requests.post", fake_requests_post):
+        at = _nueva_app(token=False)
+        _radio(at, "Moneda:").set_value("🇺🇸 USD (dólares)")
+        _consultar(at)
+        fx = at.session_state["fx_info"]
+        assert fx["moneda"] == "USD" and fx["fuente"].startswith("DOF")
+        assert fx["tc_lookup"]["2026-01-01"] == _fix(date(2025, 12, 31))
+        assert fx["tc_lookup"]["2026-01-05"] == _fix(date(2026, 1, 5))
+        assert abs(_kpi(at, "PML promedio global") - _promedio(F_INI, F_FIN, usd=True)) < 0.01
+
+
+def test_sin_tipo_de_cambio_avisa_con_error_y_queda_en_mxn():
+    def caido(url, headers=None, timeout=None, **kw):
+        raise ConnectionError("sin red")
+    with mock.patch("requests.Session.get", fake_session_get), \
+         mock.patch("requests.get", caido), \
+         mock.patch("requests.post", fake_requests_post):
+        at = _nueva_app()
+        _radio(at, "Moneda:").set_value("🇺🇸 USD (dólares)")
+        _consultar(at)
+        assert any("No se pudo obtener el tipo de cambio" in e.value for e in at.error)
+        assert at.session_state["fx_info"]["moneda"] == "MXN"
+        assert abs(_kpi(at, "PML promedio global") - _promedio(F_INI, F_FIN)) < 0.01

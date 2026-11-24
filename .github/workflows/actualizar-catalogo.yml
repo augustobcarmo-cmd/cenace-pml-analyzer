@@ -1,0 +1,38 @@
+name: Actualizar catálogo de NodosP
+
+# Revisa cada lunes si el CENACE publicó un catálogo nuevo; si lo hay, lo
+# guarda en data/ con sus novedades y hace commit (Streamlit vuelve a publicar).
+on:
+  schedule:
+    - cron: "23 13 * * 1"   # lunes 13:23 UTC (7:23 en CDMX)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependencias
+        run: pip install requests==2.34.2 openpyxl==3.1.5
+
+      - name: Revisar y descargar
+        id: catalogo
+        run: python scripts/actualizar_catalogo.py
+
+      - name: Commit del catálogo nuevo
+        if: steps.catalogo.outputs.actualizado == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/catalogo_nodos.xlsx data/catalogo_cambios.json
+          git commit -m "Catálogo de NodosP ${{ steps.catalogo.outputs.version }}"
+          git push

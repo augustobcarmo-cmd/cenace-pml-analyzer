@@ -21,6 +21,10 @@ Cambios respecto al original:
 - Aviso de publicación según el proceso (MTR: día de operación +7; MDA: día -1).
 - Compatible con Plotly 7 (Scattermap) y Streamlit 1.67 (width="stretch").
 - Catálogo de NodosP v2026-07-16, con la versión visible en la app.
+- Buscador de nodos por nombre o clave (lista desplegable), filtros que acotan,
+  importación de claves, listas guardadas, enlaces para compartir consultas y
+  novedades del catálogo (data/catalogo_cambios.json, escrito por la GitHub Action).
+- USD sin token: si no hay token de Banxico, el FIX sale del DOF (SIDOF).
 """
 
 import streamlit as st
@@ -35,6 +39,9 @@ import re
 import gc
 import hashlib
 from datetime import datetime, timedelta, date
+from urllib.parse import urlencode
+from catalogo import (parse_catalogo, etiqueta_nodo, parse_lista_claves,
+                      normalizar)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from difflib import SequenceMatcher
@@ -173,45 +180,15 @@ def cargar_catalogo_default():
     catalog_path = os.path.join(os.path.dirname(__file__), 'data', 'catalogo_nodos.xlsx')
     if not os.path.exists(catalog_path):
         return {}, ""
-    return _parse_catalogo_workbook(catalog_path)
+    return parse_catalogo(catalog_path)
 
 
 def cargar_catalogo_uploaded(file_bytes):
     """Carga catálogo desde bytes subidos por el usuario. Retorna (catalogo, version)."""
     try:
-        return _parse_catalogo_workbook(io.BytesIO(file_bytes))
+        return parse_catalogo(io.BytesIO(file_bytes))
     except Exception:
         return {}, ""
-
-
-def _version_catalogo(nombre_hoja):
-    """'Catalogo de NodosP V20260716' → 'v2026-07-16' ('' si no se reconoce)."""
-    m = re.search(r"V(\d{4})(\d{2})(\d{2})", nombre_hoja or "", flags=re.IGNORECASE)
-    return f"v{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
-
-
-def _parse_catalogo_workbook(path_or_buffer):
-    """Convierte el catálogo oficial de NodosP (xlsx) a dict. Retorna (catalogo, version)."""
-    import openpyxl
-    wb = openpyxl.load_workbook(path_or_buffer, data_only=True, read_only=True)
-    hoja = wb.sheetnames[0]
-    ws = wb[hoja]
-    catalogo = {}
-    for r in ws.iter_rows(min_row=3, values_only=True):
-        if not r or len(r) < 6 or not r[3]:
-            continue
-        clave = str(r[3]).strip()
-        catalogo[clave] = {
-            'sistema':   str(r[0]).strip() if r[0] else '',
-            'ccr':       str(r[1]).strip() if r[1] else '',
-            'zona':      str(r[2]).strip() if r[2] else '',
-            'nombre':    str(r[4]).strip() if r[4] else '',
-            'kv':        int(r[5]) if r[5] else 0,
-            'estado':    str(r[15]).strip() if len(r) > 15 and r[15] else '',
-            'municipio': str(r[17]).strip() if len(r) > 17 and r[17] else '',
-        }
-    wb.close()
-    return catalogo, _version_catalogo(hoja)
 
 
 def get_catalogo_activo():
@@ -348,6 +325,53 @@ def cargar_fx_banxico(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd, _token):
     return fx_dict
 
 
+SIDOF_INDICADORES = "https://sidof.segob.gob.mx/dof/sidof/indicadores/158"  # dólar, DOF
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cargar_fx_dof(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd):
+    """FIX publicado en el DOF (indicador 158 del SIDOF), sin token.
+
+    El DOF publica el FIX un día hábil bancario después de determinarlo. Cada
+    valor se asigna a la publicación anterior de la serie, que es su fecha de
+    determinación, para que coincida con la serie SF43718 de Banxico.
+    Retorna {YYYY-MM-DD: tc} o {} si falla.
+    """
+    d0 = date.fromisoformat(fecha_ini_yyyymmdd) - timedelta(days=10)
+    d1 = date.fromisoformat(fecha_fin_yyyymmdd) + timedelta(days=10)
+    url = f"{SIDOF_INDICADORES}/{d0:%d-%m-%Y}/{d1:%d-%m-%Y}"
+    try:
+        r = requests.get(url, headers={'Accept': 'application/json'}, timeout=30)
+        if r.status_code != 200:
+            return {}
+        lista = r.json().get("ListaIndicadores", []) or []
+    except Exception:
+        return {}
+    pubs = []
+    for x in lista:
+        try:
+            pubs.append((datetime.strptime(x["fecha"], "%d-%m-%Y").date(), float(x["valor"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    pubs.sort()
+    return {anterior.isoformat(): valor for (anterior, _), (_, valor) in zip(pubs, pubs[1:])}
+
+
+def obtener_fx(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd, token):
+    """FIX por fecha de determinación: Banxico (SIE, con token) y, si no hay, el DOF.
+
+    Retorna (fx_dict, fuente). fx_dict vacío si ninguna fuente respondió.
+    """
+    if token:
+        fx = cargar_fx_banxico(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd, token)
+        if fx:
+            return fx, "Banxico SIE (SF43718)"
+    fx = cargar_fx_dof(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd)
+    if fx:
+        return fx, "DOF (SIDOF), FIX en su fecha de determinación"
+    return {}, ""
+
+
 def construir_fx_lookup(fx_dict, fechas_necesarias):
     """Para fechas sin TC (fines de semana, feriados), usa el último día hábil disponible.
 
@@ -404,7 +428,9 @@ def convertir_acumulado_usd(acumulado, fx_lookup):
 
 def texto_conversion(tc_info):
     """Leyenda de la conversión para portadas y avisos."""
-    txt = "FIX Banxico (SF43718) del día de operación; fin de semana y feriados con el último FIX publicado"
+    txt = "FIX del día de operación; fin de semana y feriados con el último FIX publicado"
+    if tc_info and tc_info.get("fuente"):
+        txt += f" · Fuente: {tc_info['fuente']}"
     if tc_info and tc_info.get("tc_promedio"):
         txt += f" · TC promedio {tc_info['tc_promedio']:.4f}"
     return txt
@@ -2166,6 +2192,116 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SELECCIÓN DE NODOS: buscador, importación, listas guardadas y enlaces
+# ═══════════════════════════════════════════════════════════════════════
+MODOS = {"analisis": "🔬 Análisis", "datos": "📊 Datos"}
+MONEDAS = {"MXN": "🇲🇽 MXN (pesos)", "USD": "🇺🇸 USD (dólares)"}
+RUTA_DATA = os.path.join(os.path.dirname(__file__), "data")
+MAX_AGREGAR_FILTRO = 300
+
+
+@st.cache_data(show_spinner=False)
+def indice_buscador(llave, _catalogo):
+    """(claves ordenadas por nombre, {clave: etiqueta}) del catálogo activo.
+
+    llave identifica el catálogo (versión, # nodos, si fue subido) para la caché.
+    """
+    claves = sorted(_catalogo, key=lambda c: (normalizar(_catalogo[c].get("nombre", "")), c))
+    return claves, {c: etiqueta_nodo(c, _catalogo[c]) for c in claves}
+
+
+@st.cache_data(show_spinner=False)
+def catalogo_df(llave, _catalogo):
+    """Catálogo como DataFrame (una fila por clave) para los filtros."""
+    df = pd.DataFrame.from_dict(_catalogo, orient="index").reset_index()
+    return df.rename(columns={"index": "clave"})
+
+
+def _leer_json_data(nombre):
+    try:
+        with open(os.path.join(RUTA_DATA, nombre), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+@st.cache_data(show_spinner=False)
+def cargar_listas_guardadas():
+    """{nombre: [claves]} desde data/listas_nodos.json."""
+    datos = _leer_json_data("listas_nodos.json")
+    return {str(k): parse_lista_claves(" ".join(map(str, v)))
+            for k, v in datos.items() if isinstance(v, list)}
+
+
+@st.cache_data(show_spinner=False)
+def cargar_novedades_catalogo():
+    """Diferencias de la última versión del catálogo (data/catalogo_cambios.json)."""
+    return _leer_json_data("catalogo_cambios.json")
+
+
+def agregar_nodos(claves, reemplazar=False, limpiar_importacion=False):
+    """Programa claves para el buscador y vuelve a ejecutar el script.
+
+    Se aplican al inicio del siguiente rerun, antes de crear el widget
+    (Streamlit no deja cambiar su valor después de dibujarlo).
+    """
+    st.session_state["_nodos_pendientes"] = {
+        "claves": list(claves), "reemplazar": reemplazar,
+        "limpiar_importacion": limpiar_importacion,
+    }
+    st.rerun()
+
+
+def aplicar_nodos_pendientes():
+    pend = st.session_state.pop("_nodos_pendientes", None)
+    if not pend:
+        return
+    actuales = [] if pend["reemplazar"] else list(st.session_state.get("nodos_sel", []))
+    for c in pend["claves"]:
+        if c not in actuales:
+            actuales.append(c)
+    st.session_state["nodos_sel"] = actuales
+    if pend.get("limpiar_importacion"):
+        st.session_state["import_texto"] = ""
+
+
+def aplicar_query_params(fecha_max):
+    """En la primera carga de la sesión, precarga la consulta desde el enlace."""
+    if st.session_state.get("_qp_aplicados"):
+        return
+    st.session_state["_qp_aplicados"] = True
+    qp = st.query_params
+    if qp.get("nodos"):
+        st.session_state["nodos_sel"] = parse_lista_claves(qp["nodos"])
+    if qp.get("proceso", "").upper() in ("MTR", "MDA"):
+        st.session_state["proceso_sel"] = qp["proceso"].upper()
+    for clave_qp, clave_st in (("desde", "f_ini"), ("hasta", "f_fin")):
+        try:
+            st.session_state[clave_st] = min(date.fromisoformat(qp.get(clave_qp, "")), fecha_max)
+        except ValueError:
+            pass
+    if qp.get("moneda", "").upper() in MONEDAS:
+        st.session_state["moneda_sel"] = MONEDAS[qp["moneda"].upper()]
+    if qp.get("modo", "").lower() in MODOS:
+        st.session_state["modo_sel"] = MODOS[qp["modo"].lower()]
+
+
+def params_enlace(nodos, proceso, f_ini, f_fin, moneda, modo):
+    return {"nodos": ",".join(nodos), "proceso": proceso,
+            "desde": f_ini.isoformat(), "hasta": f_fin.isoformat(),
+            "moneda": moneda, "modo": "datos" if modo == MODOS["datos"] else "analisis"}
+
+
+def url_app():
+    """URL de la app sin parámetros ('' si Streamlit no la expone)."""
+    try:
+        url = st.context.url or ""
+    except Exception:
+        url = ""
+    return url.split("?")[0].replace("/~/+", "").rstrip("/")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # UI PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════
 st.markdown("""
@@ -2195,6 +2331,43 @@ if "matches_df" not in st.session_state:
 if "consulta_params" not in st.session_state:
     st.session_state["consulta_params"] = {}
 
+# Valores iniciales de los widgets (los widgets leen su valor de session_state)
+today = date.today()
+FECHA_MAX = today + timedelta(days=1)   # el MDA de mañana ya está publicado
+for _k, _v in (("f_ini", today - timedelta(days=90)), ("f_fin", today - timedelta(days=14)),
+               ("proceso_sel", "MTR"), ("moneda_sel", MONEDAS["MXN"]),
+               ("modo_sel", MODOS["analisis"]), ("nodos_sel", [])):
+    st.session_state.setdefault(_k, _v)
+aplicar_query_params(FECHA_MAX)   # ?nodos=…&proceso=…&desde=…&hasta=…&moneda=…&modo=…
+aplicar_nodos_pendientes()        # agregados desde importación, listas, filtros o novedades
+llave_catalogo = (catalogo_version, len(catalogo), catalogo_subido)
+
+# Novedades del catálogo (data/catalogo_cambios.json, lo escribe la GitHub Action)
+novedades = cargar_novedades_catalogo()
+if catalogo and not catalogo_subido and novedades.get("version") == catalogo_version:
+    altas, bajas, cambios = (novedades.get(k, []) for k in ("altas", "bajas", "cambios"))
+    with st.expander(f"🆕 Novedades del catálogo {catalogo_version} frente a "
+                     f"{novedades.get('version_anterior', '—')}: {len(altas)} NodosP nuevos · "
+                     f"{len(bajas)} bajas · {len(cambios)} cambios de datos"):
+        if altas:
+            st.markdown("**NodosP nuevos**")
+            st.dataframe(pd.DataFrame(altas)[["clave", "nombre", "zona", "kv", "estado", "ccr"]],
+                         hide_index=True, width="stretch")
+            if st.button(f"➕ Agregar los {len(altas)} nuevos al buscador", key="btn_add_novedades"):
+                agregar_nodos([a["clave"] for a in altas])
+        if bajas:
+            st.markdown("**Dados de baja:** " + ", ".join(f"{b['clave']} ({b.get('nombre', '')})"
+                                                           for b in bajas))
+        if cambios:
+            st.markdown("**Cambios de datos**")
+            st.dataframe(pd.DataFrame(cambios).astype(str), hide_index=True, width="stretch")
+        if novedades.get("control_de_cambios"):
+            st.markdown("**Control de cambios del CENACE**")
+            st.markdown("\n".join(f"- {c['descripcion']} ({c['version']})"
+                                   for c in novedades["control_de_cambios"]))
+        st.caption(f"Fuente: CENACE, Catálogo de NodosP · revisado el "
+                   f"{str(novedades.get('revisado', ''))[:10]}")
+
 with st.sidebar:
     st.markdown(
         f"<h2 style='color:{RE_BLUE};margin-bottom:0;font-weight:700;'>"
@@ -2207,7 +2380,7 @@ with st.sidebar:
     modo = st.radio(
         "Selecciona qué hacer:",
         options=["🔬 Análisis", "📊 Datos"],
-        index=0,
+        key="modo_sel",
         help=(
             "**Análisis**: descarga + dashboard (KPIs, mapa, tablas y gráficas)\n\n"
             "**Datos**: descarga + Centro de descargas (Excel de datos y de análisis)"
@@ -2225,7 +2398,7 @@ with st.sidebar:
     moneda_sel = st.radio(
         "Moneda:",
         options=["🇲🇽 MXN (pesos)", "🇺🇸 USD (dólares)"],
-        index=0,
+        key="moneda_sel",
         label_visibility="collapsed",
         help=(
             "**MXN**: PML directo del CENACE en pesos.\n\n"
@@ -2237,111 +2410,109 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**📍 Nodos CENACE**")
+    caja_buscador = st.container()
+    claves_orden, etiquetas = indice_buscador(llave_catalogo, catalogo) if catalogo else ([], {})
 
-    # Procesar pending del botón "Agregar al textarea" (debe ir ANTES del text_area)
-    if "nodos_pending" in st.session_state and st.session_state["nodos_pending"]:
-        # Mover de pending al input
-        st.session_state["nodos_input"] = st.session_state["nodos_pending"]
-        st.session_state["nodos_pending"] = ""
-
-    nodos_input = st.text_area(
-        "Lista de claves",
-        height=120,
-        placeholder="01VAJ-230\n01XAL-230\n06FUN-115",
-        key="nodos_input",
-    )
-
-    # Badge si los nodos vinieron del filtro
-    if st.session_state.get("nodos_from_filter"):
-        st.caption(f"📍 **{st.session_state['nodos_from_filter']} nodos del filtro**")
-
-    # ─── SELECTOR JERÁRQUICO ───
-    with st.expander("🔍 Buscar nodos por filtros (Estado / Zona / CCR / kV)"):
+    # Filtros: no generan otra lista, solo acotan las opciones del buscador
+    claves_filtradas = None
+    with st.expander("🎯 Acotar búsqueda (sistema, estado, zona, CCR, kV)"):
         if catalogo:
-            cat_df = pd.DataFrame.from_dict(catalogo, orient='index').reset_index()
-            cat_df = cat_df.rename(columns={'index': 'clave'})
-
-            sistemas_disp = sorted(cat_df['sistema'].dropna().unique())
-            sistemas_disp = [s for s in sistemas_disp if s]
+            df_f = catalogo_df(llave_catalogo, catalogo)
+            sistemas_disp = sorted(s for s in df_f['sistema'].dropna().unique() if s)
             sis_sel = st.selectbox("🌎 Sistema", ["Todos"] + sistemas_disp, key="filt_sis")
-            df_f = cat_df.copy() if sis_sel == "Todos" else cat_df[cat_df['sistema'] == sis_sel]
-
-            estados_disp = sorted([e for e in df_f['estado'].dropna().unique() if e])
-            est_sel = st.multiselect("🏛️ Estado(s)", estados_disp, key="filt_est")
-            if est_sel:
-                df_f = df_f[df_f['estado'].isin(est_sel)]
-
-            municipios_disp = sorted([m for m in df_f['municipio'].dropna().unique() if m])
-            mun_sel = st.multiselect("🏘️ Municipio(s)", municipios_disp, key="filt_mun")
-            if mun_sel:
-                df_f = df_f[df_f['municipio'].isin(mun_sel)]
-
-            zonas_disp = sorted([z for z in df_f['zona'].dropna().unique() if z])
-            zona_sel = st.multiselect("🗺️ Zona CENACE", zonas_disp, key="filt_zona")
-            if zona_sel:
-                df_f = df_f[df_f['zona'].isin(zona_sel)]
-
-            ccr_disp = sorted([c for c in df_f['ccr'].dropna().unique() if c])
-            ccr_sel = st.multiselect("📍 CCR (Centro Control Regional)", ccr_disp, key="filt_ccr")
-            if ccr_sel:
-                df_f = df_f[df_f['ccr'].isin(ccr_sel)]
-
-            kvs_disp = sorted([int(k) for k in df_f['kv'].dropna().unique() if k > 0])
-            kv_sel = st.multiselect("⚡ Voltaje (kV)", kvs_disp, key="filt_kv")
+            activos = sis_sel != "Todos"
+            if activos:
+                df_f = df_f[df_f['sistema'] == sis_sel]
+            for campo, etiqueta_f, clave_w in (("estado", "🏛️ Estado(s)", "filt_est"),
+                                               ("municipio", "🏘️ Municipio(s)", "filt_mun"),
+                                               ("zona", "🗺️ Zona de carga", "filt_zona"),
+                                               ("ccr", "📍 CCR (Centro de Control Regional)", "filt_ccr")):
+                disponibles = sorted(v for v in df_f[campo].dropna().unique() if v)
+                elegidos = st.multiselect(etiqueta_f, disponibles, key=clave_w)
+                if elegidos:
+                    df_f = df_f[df_f[campo].isin(elegidos)]
+                    activos = True
+            kvs_disp = sorted(int(k) for k in df_f['kv'].dropna().unique() if k > 0)
+            kv_sel = st.multiselect("⚡ Tensión (kV)", kvs_disp, key="filt_kv")
             if kv_sel:
                 df_f = df_f[df_f['kv'].isin(kv_sel)]
-
-            st.markdown(f"**📋 {len(df_f):,} nodos coinciden**")
-
-            if len(df_f) > 0:
-                # Buscador opcional
-                buscar = st.text_input("🔎 Buscar por nombre/clave (opcional)", key="filt_buscar")
-                if buscar:
-                    mask = (df_f['clave'].str.contains(buscar, case=False, na=False) |
-                            df_f['nombre'].str.contains(buscar, case=False, na=False))
-                    df_f = df_f[mask]
-                    st.caption(f"Tras filtro: **{len(df_f):,} nodos**")
-
-                # Mostrar tabla compacta
-                if len(df_f) > 0:
-                    st.dataframe(
-                        df_f[['clave', 'nombre', 'ccr', 'estado', 'kv']].head(100),
-                        width="stretch", hide_index=True,
-                        column_config={
-                            "clave":  st.column_config.TextColumn("Clave", width="small"),
-                            "nombre": st.column_config.TextColumn("Nombre", width="medium"),
-                            "ccr":    st.column_config.TextColumn("CCR", width="small"),
-                            "estado": st.column_config.TextColumn("Estado", width="small"),
-                            "kv":     st.column_config.NumberColumn("kV", format="%d"),
-                        },
-                        height=200,
-                    )
-                    if len(df_f) > 100:
-                        st.caption(f"⚠️ Mostrando solo los primeros 100 (refina filtros para ver todos)")
-
-                    # Botón para agregar al textarea — limpia consulta previa
-                    if st.button(f"✅ Agregar {len(df_f)} nodos (reemplaza textarea)",
-                                 key="btn_add_nodos"):
-                        nuevas_claves = "\n".join(df_f['clave'].tolist())
-                        # Reemplazar (no concatenar) para que sea predecible
-                        st.session_state["nodos_pending"] = nuevas_claves
-                        st.session_state["nodos_from_filter"] = len(df_f)
-                        # Limpiar resultado de consulta anterior (forzar re-ejecutar)
-                        for k in ("consulta_ejecutada", "acumulado", "matches_df",
-                                  "fx_info", "consulta_params",
-                                  "excel_datos_bytes", "excel_analisis_bytes"):
-                            if k in st.session_state:
-                                if k == "consulta_ejecutada":
-                                    st.session_state[k] = False
-                                else:
-                                    st.session_state[k] = None
-                        st.rerun()
+                activos = True
+            if activos:
+                claves_filtradas = set(df_f["clave"])
+                n_f = len(claves_filtradas)
+                st.markdown(f"**{n_f:,} nodos** quedan en el buscador")
+                if 0 < n_f <= MAX_AGREGAR_FILTRO:
+                    if st.button(f"➕ Agregar los {n_f} a la selección", key="btn_add_filtrados",
+                                 width="stretch"):
+                        agregar_nodos([c for c in claves_orden if c in claves_filtradas])
+                elif n_f > MAX_AGREGAR_FILTRO:
+                    st.caption(f"Acota más para agregarlos de una vez (máximo {MAX_AGREGAR_FILTRO}).")
+            else:
+                st.caption("Sin filtros: el buscador ofrece todo el catálogo.")
         else:
-            st.warning("No hay catálogo cargado para filtrar.")
+            st.warning("No hay catálogo cargado.")
+
+    # Importar claves pegadas (p. ej. desde Excel)
+    with st.expander("📋 Importar lista de claves"):
+        st.text_area("Claves", key="import_texto", height=100, label_visibility="collapsed",
+                     placeholder="Una clave por línea o separadas por comas\n04TST-115\n04EMY-115")
+        claves_import = parse_lista_claves(st.session_state.get("import_texto", ""))
+        c_imp1, c_imp2 = st.columns(2)
+        if c_imp1.button("➕ Agregar", key="btn_import_add", width="stretch"):
+            if claves_import:
+                agregar_nodos(claves_import, limpiar_importacion=True)
+            st.caption("Pega al menos una clave.")
+        if c_imp2.button("🔁 Reemplazar", key="btn_import_rep", width="stretch"):
+            if claves_import:
+                agregar_nodos(claves_import, reemplazar=True, limpiar_importacion=True)
+            st.caption("Pega al menos una clave.")
+        st.caption("Las claves que no estén en el catálogo se marcan y se consultan como SIN.")
+
+    # Listas guardadas (data/listas_nodos.json)
+    listas = cargar_listas_guardadas()
+    if listas:
+        with st.expander("📂 Listas guardadas"):
+            nombre_lista = st.selectbox("Lista", list(listas), key="lista_sel",
+                                        label_visibility="collapsed")
+            st.caption(", ".join(listas[nombre_lista]))
+            c_l1, c_l2 = st.columns(2)
+            if c_l1.button("➕ Agregar", key="btn_lista_add", width="stretch"):
+                agregar_nodos(listas[nombre_lista])
+            if c_l2.button("🔁 Reemplazar", key="btn_lista_rep", width="stretch"):
+                agregar_nodos(listas[nombre_lista], reemplazar=True)
+            st.caption("Se editan en `data/listas_nodos.json` del repositorio.")
+
+    # Buscador (se dibuja arriba de los expanders)
+    with caja_buscador:
+        seleccion_previa = st.session_state.get("nodos_sel", [])
+        base = claves_orden if claves_filtradas is None else [c for c in claves_orden if c in claves_filtradas]
+        en_base = set(base)
+        st.multiselect(
+            "🔎 Buscar y elegir nodos",
+            options=base + [c for c in seleccion_previa if c not in en_base],
+            format_func=lambda c: etiquetas.get(c) or etiqueta_nodo(c, None),
+            key="nodos_sel",
+            placeholder="Nombre, clave, zona o estado (p. ej. Tast)",
+            help=("Escribe parte del nombre, la clave, la zona o el estado: la lista sugiere los "
+                  "nodos que coinciden, ordenados por relevancia. Con una búsqueda escrita, "
+                  "«Select all» agrega todas las coincidencias."),
+        )
+        sel = st.session_state.get("nodos_sel", [])
+        if sel:
+            with st.expander(f"📋 Ver los {len(sel)} nodos elegidos"):
+                filas_sel = []
+                for c in sel:
+                    info = catalogo.get(c) or {}
+                    filas_sel.append({"Clave": c, "Nombre": info.get("nombre", "⚠️ fuera del catálogo"),
+                                      "CCR": info.get("ccr", ""), "Zona": info.get("zona", ""),
+                                      "kV": info.get("kv") or None, "Estado": info.get("estado", "")})
+                st.dataframe(pd.DataFrame(filas_sel), hide_index=True, width="stretch",
+                             height=min(35 * len(sel) + 38, 300))
+
 
     # Proceso MTR/MDA — el sistema (SIN/BCA/BCS) se detecta de cada nodo con el catálogo
     proceso = st.selectbox(
-        "⚙️ Proceso", ["MTR", "MDA"], index=0, key="proceso_sel",
+        "⚙️ Proceso", ["MTR", "MDA"], key="proceso_sel",
         help="**MTR** = Mercado de Tiempo Real (ex post; se publica 7 días después del día "
              "de operación). **MDA** = Mercado del Día en Adelanto (se publica un día antes "
              "del día de operación).")
@@ -2349,14 +2520,10 @@ with st.sidebar:
 
     st.markdown("**📅 Período**")
     col_f1, col_f2 = st.columns(2)
-    today = date.today()
-    fecha_max = today + timedelta(days=1)   # el MDA de mañana ya está publicado
     with col_f1:
-        f_ini = st.date_input("Desde", value=today - timedelta(days=90),
-                              max_value=fecha_max, key="f_ini")
+        f_ini = st.date_input("Desde", max_value=FECHA_MAX, key="f_ini")
     with col_f2:
-        f_fin = st.date_input("Hasta", value=today - timedelta(days=14),
-                              max_value=fecha_max, key="f_fin",
+        f_fin = st.date_input("Hasta", max_value=FECHA_MAX, key="f_fin",
                               help="MTR: hasta el día de operación −7. MDA: hasta mañana.")
 
     if proceso == "MTR" and f_fin > today - timedelta(days=7):
@@ -2369,15 +2536,15 @@ with st.sidebar:
 
     # Botón limpiar todo
     if st.button("🧹 Limpiar todo", key="btn_clear_all", width="stretch",
-                  help="Reset completo: borra textarea, filtros, datos descargados y descargas pendientes."):
+                  help="Reset completo: borra la selección de nodos, filtros, datos descargados y descargas pendientes."):
         # Limpiar todo el session_state
         keys_to_clear = [
             "consulta_ejecutada", "acumulado", "matches_df", "fx_info",
-            "consulta_params", "nodos_input", "nodos_pending", "nodos_from_filter",
+            "consulta_params", "nodos_sel", "import_texto", "lista_sel",
             "excel_datos_bytes", "excel_analisis_bytes", "moneda",
             # Filtros
             "filt_sis", "filt_est", "filt_mun", "filt_zona", "filt_ccr",
-            "filt_kv", "filt_buscar",
+            "filt_kv",
             # Selectores y opciones del Excel de análisis
             "sel_heatmap", "sel_multiano", "conf_grande",
             "xa_resumen", "xa_top_pml", "xa_top_vol", "xa_top_neg", "xa_multi", "xa_spread",
@@ -2385,6 +2552,7 @@ with st.sidebar:
         for k in keys_to_clear:
             if k in st.session_state:
                 del st.session_state[k]
+        st.query_params.clear()
         st.rerun()
 
     with st.expander("📤 Actualizar catálogo de nodos"):
@@ -2450,12 +2618,7 @@ with col_left:
         unsafe_allow_html=True,
     )
 
-    nodos = []
-    if nodos_input.strip():
-        nodos_raw = re.split(r"[,\n]+", nodos_input.strip())
-        nodos = [n.strip().upper() for n in nodos_raw if n.strip()]
-        seen = set()
-        nodos = [n for n in nodos if not (n in seen or seen.add(n))]
+    nodos = list(st.session_state.get("nodos_sel", []))
 
     if nodos:
         cv = [n for n in nodos if n in catalogo] if catalogo else nodos
@@ -2510,14 +2673,14 @@ with col_right:
     st.markdown("### 📋 Instrucciones")
     if es_solo_datos:
         st.markdown("""
-        1. Pega claves de nodos o búscalos con los filtros
+        1. Busca nodos por nombre o clave (o importa una lista)
         2. Elige proceso, moneda y fechas
         3. Click en **Ejecutar**
         4. Genera y descarga el Excel de datos o el de análisis
         """)
     else:
         st.markdown("""
-        1. Pega claves de nodos o búscalos con los filtros
+        1. Busca nodos por nombre o clave (o importa una lista)
         2. Elige proceso, moneda y fechas
         3. Click en **Ejecutar**
         4. Explora el dashboard interactivo
@@ -2577,61 +2740,41 @@ if boton and nodos:
         # ─── CONVERSIÓN A USD si aplica ───
         moneda_seleccionada = st.session_state.get("moneda", "MXN")
         if moneda_seleccionada == "USD":
-            token = obtener_token_banxico()
-            if not token:
-                st.warning(
-                    "⚠️ No se encontró el token de Banxico en los secrets de Streamlit. "
-                    "El análisis se mostrará en MXN. Para usar USD, agrega "
-                    "`BANXICO_TOKEN` en Settings → Secrets de tu app."
+            # Serie FIX del período, desde 10 días antes para cubrir fines de semana y feriados iniciales
+            f_ini_buffer = (f_ini - timedelta(days=10)).strftime("%Y-%m-%d")
+            f_fin_buffer = f_fin.strftime("%Y-%m-%d")
+            with st.spinner("📥 Descargando el tipo de cambio FIX..."):
+                fx_dict, fuente_fx = obtener_fx(f_ini_buffer, f_fin_buffer, obtener_token_banxico())
+
+            fechas_unicas = {f.get("fecha", "") for filas in acumulado.values() for f in filas}
+            fx_lookup = construir_fx_lookup(fx_dict, fechas_unicas) if fx_dict else {}
+            if not fx_lookup:
+                st.error(
+                    "❌ No se pudo obtener el tipo de cambio FIX (ni de Banxico ni del DOF). "
+                    "**Los resultados de esta consulta están en MXN, no en USD.** "
+                    "Vuelve a ejecutar en unos minutos."
                 )
                 st.session_state["moneda"] = "MXN"
-                fx_info["advertencia"] = "Sin token Banxico — análisis en MXN."
+                fx_info["advertencia"] = "Sin tipo de cambio — análisis en MXN."
             else:
-                # Serie FIX del período, desde 10 días antes para cubrir fines de semana y feriados iniciales
-                f_ini_buffer = (f_ini - timedelta(days=10)).strftime("%Y-%m-%d")
-                f_fin_buffer = f_fin.strftime("%Y-%m-%d")
-
-                with st.spinner("📥 Descargando tipo de cambio FIX de Banxico..."):
-                    fx_dict = cargar_fx_banxico(f_ini_buffer, f_fin_buffer, token)
-
-                if not fx_dict:
-                    st.warning(
-                        "⚠️ No se pudo obtener el tipo de cambio de Banxico. "
-                        "El análisis se mostrará en MXN."
-                    )
-                    st.session_state["moneda"] = "MXN"
-                    fx_info["advertencia"] = "Banxico no respondió — análisis en MXN."
-                else:
-                    # Construir lookup completo (incluye fines de semana)
-                    fechas_unicas = set()
-                    for nodo, filas in acumulado.items():
-                        for f in filas:
-                            fechas_unicas.add(f.get("fecha", ""))
-                    fx_lookup = construir_fx_lookup(fx_dict, fechas_unicas)
-
-                    # NOTA: NO aplicamos conversión al acumulado. Se queda en MXN crudo.
-                    # La conversión a USD se hace al construir el DataFrame en
-                    # acumulado_a_dataframe(), usando el fx_lookup guardado en session_state.
-                    # Esto evita el bug de doble-conversión y permite cambiar moneda
-                    # sin re-descargar datos.
-
-                    # Guardar info
-                    if fx_lookup:
-                        tcs = list(fx_lookup.values())
-                        fx_info = {
-                            "moneda": "USD",
-                            "tc_promedio": sum(tcs)/len(tcs) if tcs else None,
-                            "tc_min": min(tcs) if tcs else None,
-                            "tc_max": max(tcs) if tcs else None,
-                            "tc_lookup": fx_lookup,
-                            "fuente": "Banxico FIX (SF43718)",
-                            "advertencia": "",
-                        }
-                        st.success(
-                            f"💱 Análisis convertido a USD. TC FIX promedio del período: "
-                            f"**{fx_info['tc_promedio']:.4f} MXN/USD** "
-                            f"(rango: {fx_info['tc_min']:.4f} – {fx_info['tc_max']:.4f})"
-                        )
+                # El acumulado se queda en MXN: la conversión se hace al construir el
+                # DataFrame y los Excel, con este lookup (permite cambiar de moneda sin
+                # volver a descargar).
+                tcs = list(fx_lookup.values())
+                fx_info = {
+                    "moneda": "USD",
+                    "tc_promedio": sum(tcs) / len(tcs),
+                    "tc_min": min(tcs),
+                    "tc_max": max(tcs),
+                    "tc_lookup": fx_lookup,
+                    "fuente": fuente_fx,
+                    "advertencia": "",
+                }
+                st.success(
+                    f"💱 Análisis convertido a USD con el FIX de cada día ({fuente_fx}). "
+                    f"TC promedio del período: **{fx_info['tc_promedio']:.4f} MXN/USD** "
+                    f"(rango: {fx_info['tc_min']:.4f} – {fx_info['tc_max']:.4f})"
+                )
 
         # Geocodificación de los nodos con datos para el mapa de PML (modo Análisis)
         matches_df = None
@@ -2661,7 +2804,11 @@ if boton and nodos:
             "modo": modo, "errores": errores,
             "tiempo": time.time() - t0,
             "moneda_aplicada": st.session_state.get("moneda", "MXN"),
+            "nodos": list(nodos),
+            "enlace": params_enlace(nodos, proceso, f_ini, f_fin,
+                                    "USD" if "USD" in st.session_state["moneda_sel"] else "MXN", modo),
         }
+        st.query_params.from_dict(st.session_state["consulta_params"]["enlace"])
 
     except Exception as e:
         st.error(f"❌ Error: {type(e).__name__}: {e}")
@@ -2707,7 +2854,7 @@ if st.session_state.get("consulta_ejecutada"):
     parametros_cambiaron = []
     if moneda_actual != moneda_consulta and not cambio_moneda_instantaneo:
         parametros_cambiaron.append(
-            f"moneda ({moneda_consulta} → {moneda_actual}) — necesita descargar TC Banxico"
+            f"moneda ({moneda_consulta} → {moneda_actual}) — necesita descargar el tipo de cambio"
         )
     # Comparar fechas y proceso
     f_ini_str = f_ini.strftime("%Y/%m/%d")
@@ -2716,6 +2863,8 @@ if st.session_state.get("consulta_ejecutada"):
         parametros_cambiaron.append("fechas")
     if proceso != params.get("proceso"):
         parametros_cambiaron.append(f"proceso ({params.get('proceso')} → {proceso})")
+    if params.get("nodos") is not None and set(nodos) != set(params["nodos"]):
+        parametros_cambiaron.append("nodos")
 
     # Validar si los datos actuales sirven para el modo actual
     modo_requiere_datos = True
@@ -2774,6 +2923,10 @@ if st.session_state.get("consulta_ejecutada"):
         cx.metric("Nodos con datos", f"{len(acumulado)}/{len(nodos) if nodos else len(acumulado)}")
         cy.metric("Total registros", f"{n_total:,}")
         cz.metric("Tiempo descarga", f"{params.get('tiempo', 0):.0f}s")
+
+        if params.get("enlace"):
+            st.caption("🔗 Enlace de esta consulta (para compartirla o guardarla en favoritos):")
+            st.code(f"{url_app()}/?{urlencode(params['enlace'])}", language=None)
 
         if params.get("errores"):
             with st.expander(f"⚠️ {len(params['errores'])} errores en consultas"):
