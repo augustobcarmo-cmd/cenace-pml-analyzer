@@ -14,6 +14,10 @@ Cambios respecto al original:
 - Un solo Excel de análisis de PML, con secciones a elegir (resumen, rankings,
   multi-año y spread por CCR).
 - Registros ordenados por fecha y hora tras la descarga paralela.
+- USD: el Excel de datos también se convierte con el FIX de cada día (antes salía en
+  MXN con etiqueta USD) y trae la columna del tipo de cambio aplicado.
+- Caché del DataFrame con huella del contenido: una consulta nueva del mismo largo ya
+  no reutiliza los datos de la anterior.
 - Aviso de publicación según el proceso (MTR: día de operación +7; MDA: día -1).
 - Compatible con Plotly 7 (Scattermap) y Streamlit 1.67 (width="stretch").
 - Catálogo de NodosP v2026-07-16, con la versión visible en la app.
@@ -29,6 +33,7 @@ import io
 import os
 import re
 import gc
+import hashlib
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -371,26 +376,38 @@ def construir_fx_lookup(fx_dict, fechas_necesarias):
     return lookup
 
 
-def aplicar_conversion_usd(acumulado, fx_lookup):
-    """Aplica conversión MXN→USD a todos los registros de acumulado.
+def convertir_acumulado_usd(acumulado, fx_lookup):
+    """Copia del acumulado en USD: cada registro se divide entre el FIX de su fecha.
 
-    Modifica `acumulado` in-place dividiendo PML, PML_ENE, PML_PER, PML_CNG
-    entre el tipo de cambio del día. Retorna el acumulado modificado.
+    Fines de semana y feriados usan el último FIX publicado (construir_fx_lookup).
+    Agrega la llave 'tc' con el tipo de cambio aplicado. El acumulado original
+    (MXN) no se modifica. Los registros sin TC se omiten, como en el dashboard.
     """
-    if not fx_lookup:
-        return acumulado
-
+    out = {}
     for nodo, filas in acumulado.items():
+        conv = []
         for f in filas:
-            fecha = f.get("fecha", "")
-            tc = fx_lookup.get(fecha)
+            tc = fx_lookup.get(f.get("fecha", ""))
             if not tc or tc <= 0:
                 continue
+            g = dict(f)
             for k in ("pml", "pml_ene", "pml_per", "pml_cng"):
-                v = f.get(k)
+                v = g.get(k)
                 if isinstance(v, (int, float)):
-                    f[k] = round(v / tc, 4)
-    return acumulado
+                    g[k] = round(v / tc, 4)
+            g["tc"] = tc
+            conv.append(g)
+        if conv:
+            out[nodo] = conv
+    return out
+
+
+def texto_conversion(tc_info):
+    """Leyenda de la conversión para portadas y avisos."""
+    txt = "FIX Banxico (SF43718) del día de operación; fin de semana y feriados con el último FIX publicado"
+    if tc_info and tc_info.get("tc_promedio"):
+        txt += f" · TC promedio {tc_info['tc_promedio']:.4f}"
+    return txt
 
 
 def obtener_token_banxico():
@@ -878,6 +895,13 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
     _side = Side(style="thin", color="BFBFBF")
     BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
 
+    # El acumulado llega siempre en MXN: en USD se convierte cada registro con el FIX de su fecha
+    con_tc = moneda == "USD" and bool(tc_info and tc_info.get("tc_lookup"))
+    if con_tc:
+        acumulado = convertir_acumulado_usd(acumulado, tc_info["tc_lookup"])
+    elif moneda == "USD":
+        moneda = "MXN"   # sin tipo de cambio no se etiqueta como USD
+
     _sym = "USD$" if moneda == "USD" else "$"
 
     def hdr(cell, bg=C_HEADER, fg=C_WHITE, size=11):
@@ -894,6 +918,11 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
     COLS   = ["Fecha", "Hora", f"PML ({_sym}/MWh)", "Energía", "Pérdidas", "Congestión"]
     ANCHOS = [14, 8, 18, 16, 16, 18]
     ES_NUM = [False, True, True, True, True, True]
+    if con_tc:
+        COLS.append("TC FIX (MXN/USD)")
+        ANCHOS.append(16)
+        ES_NUM.append(True)
+    ULT = get_column_letter(len(COLS))
 
     wb = Workbook()
     ws = wb.active
@@ -929,7 +958,7 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
         ("Fecha inicial", fecha_ini), ("Fecha final", fecha_fin),
         ("Nodos en reporte", f"{len(acumulado):,} nodos"),
         ("Total registros", f"{sum(len(f) for f in acumulado.values()):,} filas"),
-        ("Moneda", f"{moneda}" + (f" · TC FIX promedio: {tc_info['tc_promedio']:.4f}" if tc_info and tc_info.get('tc_promedio') else "")),
+        ("Moneda", "USD · " + texto_conversion(tc_info) if con_tc else "MXN"),
         ("Fuente", "CENACE · servicio web SW-PML"),
         ("Fecha generación", _NOW),
     ]
@@ -943,9 +972,9 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
         ws.merge_cells(f"E{ri}:H{ri}")
         c2 = ws[f"E{ri}"]; c2.value = val
         c2.font = Font(size=11, name="Arial")
-        c2.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c2.alignment = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
         c2.border = BORDE
-        ws.row_dimensions[ri].height = 22
+        ws.row_dimensions[ri].height = 30 if lbl == "Moneda" and con_tc else 22
 
     # Pie de portada
     ws.merge_cells("B17:H17")
@@ -973,7 +1002,7 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws_res.row_dimensions[1].height = 28
 
-    res_cols = ["Nodo", "# Registros", "PML promedio", "PML máximo", "PML mínimo", "Período"]
+    res_cols = ["Nodo", "# Registros", f"PML promedio ({_sym}/MWh)", "PML máximo", "PML mínimo", "Período"]
     for ci, col in enumerate(res_cols, 1):
         hdr(ws_res.cell(row=2, column=ci, value=col), bg=C_SUB)
     ws_res.row_dimensions[2].height = 22
@@ -1004,14 +1033,14 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
 
     for nodo, filas in acumulado.items():
         ws_n = wb.create_sheet(title=nodo[:31])
-        ws_n.merge_cells("A1:F1")
+        ws_n.merge_cells(f"A1:{ULT}1")
         c = ws_n["A1"]; c.value = f"PML — Nodo: {nodo}"
         c.font = Font(bold=True, color=C_WHITE, size=13, name="Arial")
         c.fill = PatternFill("solid", start_color=C_HEADER)
         c.alignment = Alignment(horizontal="center", vertical="center")
         ws_n.row_dimensions[1].height = 28
 
-        ws_n.merge_cells("A2:F2")
+        ws_n.merge_cells(f"A2:{ULT}2")
         c = ws_n["A2"]
         c.value = (f"Sistema: {sistema} | Proceso: {proceso} | "
                    f"Período: {fecha_ini} → {fecha_fin} | Total: {len(filas):,} | "
@@ -1027,18 +1056,21 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
         ws_n.row_dimensions[3].height = 22
 
         for fila in filas:
-            ws_n.append([fila["fecha"], fila["hora"], fila["pml"],
-                         fila["pml_ene"], fila["pml_per"], fila["pml_cng"]])
+            valores = [fila["fecha"], fila["hora"], fila["pml"],
+                       fila["pml_ene"], fila["pml_per"], fila["pml_cng"]]
+            if con_tc:
+                valores.append(fila["tc"])
+            ws_n.append(valores)
         for i in range(len(filas)):
             row_idx = i + 4
             es_alt = (i % 2 == 0)
-            for ci in range(1, 7):
+            for ci in range(1, len(COLS) + 1):
                 cc = ws_n.cell(row=row_idx, column=ci)
                 cc.font = _FONT_DATO
                 cc.border = BORDE
                 cc.alignment = _ALIGN_NUM if ES_NUM[ci-1] else _ALIGN_TXT
                 if es_alt: cc.fill = _FILL_ALT
-                if ES_NUM[ci-1]: cc.number_format = "#,##0.00"
+                if ES_NUM[ci-1]: cc.number_format = "#,##0.0000" if COLS[ci-1].startswith("TC") else "#,##0.00"
         ws_n.freeze_panes = "A4"
 
     buffer = io.BytesIO()
@@ -1129,8 +1161,7 @@ def generar_excel_analisis(df, df_resumen, opciones, sistema, proceso,
         ("Sistema", sistema), ("Proceso", proceso),
         ("Período", f"{fecha_ini} → {fecha_fin}"),
         ("Nodos", f"{df['nodo'].nunique() if not df.empty else 0}"),
-        ("Moneda", f"{moneda}" + (f" · TC FIX promedio: {tc_info['tc_promedio']:.4f}"
-                                     if tc_info and tc_info.get('tc_promedio') else "")),
+        ("Moneda", "USD · " + texto_conversion(tc_info) if moneda == "USD" else "MXN"),
         ("Fuente", "CENACE · servicio web SW-PML"),
         ("Secciones", ", ".join(secciones_inc) if secciones_inc else "—"),
         ("Fecha generación", _NOW),
@@ -1420,13 +1451,30 @@ def acumulado_a_dataframe(acumulado, catalogo, moneda=None, fx_lookup=None):
         fx_info_state = st.session_state.get("fx_info", {})
         fx_lookup = fx_info_state.get("tc_lookup", {}) if isinstance(fx_info_state, dict) else {}
 
-    # Hash key: # nodos + total filas + primer nodo + moneda (clave!)
-    # La moneda DEBE estar en el cache key para que MXN y USD tengan caches separados
-    key = (len(acumulado),
-           sum(len(v) for v in acumulado.values()),
-           list(acumulado.keys())[0] if acumulado else "",
-           moneda)
+    # Llave de caché: huella del contenido + moneda + tipos de cambio. Con solo
+    # (# nodos, # filas, primer nodo) dos consultas del mismo largo (otras fechas u
+    # otro proceso) reutilizaban el DataFrame de la consulta anterior.
+    key = (_huella_acumulado(acumulado), moneda,
+           _huella_fx(fx_lookup) if moneda == "USD" else "")
     return acumulado_a_dataframe_cached(str(key), acumulado, catalogo, moneda, fx_lookup)
+
+
+def _huella_acumulado(acumulado):
+    """Huella del contenido: nodos, # registros y tres registros de muestra por nodo."""
+    partes = []
+    for nodo, filas in acumulado.items():
+        partes.append(f"{nodo}:{len(filas)}")
+        if filas:
+            for f in (filas[0], filas[len(filas) // 2], filas[-1]):
+                partes.append(f"{f.get('fecha')}|{f.get('hora')}|{f.get('pml')}")
+    return hashlib.md5("§".join(partes).encode("utf-8")).hexdigest()
+
+
+def _huella_fx(fx_lookup):
+    """Huella de los tipos de cambio usados en la conversión."""
+    if not fx_lookup:
+        return ""
+    return hashlib.md5(repr(sorted(fx_lookup.items())).encode("utf-8")).hexdigest()
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -2181,8 +2229,8 @@ with st.sidebar:
         label_visibility="collapsed",
         help=(
             "**MXN**: PML directo del CENACE en pesos.\n\n"
-            "**USD**: convertido día por día con el tipo de cambio "
-            "FIX de Banxico (serie SF43718)."
+            "**USD**: cada hora se divide entre el FIX de Banxico (serie SF43718) "
+            "de su día de operación; fines de semana y feriados usan el último FIX publicado."
         ),
     )
     st.session_state["moneda"] = "USD" if "USD" in moneda_sel else "MXN"
@@ -2386,8 +2434,7 @@ with st.sidebar:
                 st.session_state["cat_last_processed"] = ""
                 st.rerun()
 
-    st.caption("Recurrent Energy · Canadian Solar\n\n"
-               "Basado en el CENACE PML Analyzer de Sebastian Roldan (SRF).")
+    st.caption("Recurrent Energy · Canadian Solar")
 
 
 col_left, col_right = st.columns([2, 1])
@@ -2540,8 +2587,8 @@ if boton and nodos:
                 st.session_state["moneda"] = "MXN"
                 fx_info["advertencia"] = "Sin token Banxico — análisis en MXN."
             else:
-                # Descargar serie FIX para el período (con buffer de 5 días para fin de semana)
-                f_ini_buffer = (f_ini - timedelta(days=5)).strftime("%Y-%m-%d")
+                # Serie FIX del período, desde 10 días antes para cubrir fines de semana y feriados iniciales
+                f_ini_buffer = (f_ini - timedelta(days=10)).strftime("%Y-%m-%d")
                 f_fin_buffer = f_fin.strftime("%Y-%m-%d")
 
                 with st.spinner("📥 Descargando tipo de cambio FIX de Banxico..."):
@@ -2758,5 +2805,4 @@ if st.session_state.get("consulta_ejecutada"):
 
 
 st.divider()
-st.caption("⚡ PML CENACE · Recurrent Energy / Canadian Solar · Datos: CENACE (SW-PML) y Banxico (FIX) · "
-           "Basado en el CENACE PML Analyzer de Sebastian Roldan (SRF)")
+st.caption("⚡ PML CENACE · Recurrent Energy / Canadian Solar · Datos: CENACE (SW-PML) y Banxico (FIX)")
