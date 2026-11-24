@@ -282,3 +282,28 @@ def test_fallo_de_openstreetmap_no_queda_en_cache(app):
     sin_errores(app)
     ub = app.session_state["ubicaciones"]["df"].set_index("clave")
     assert ub.loc["04TST-115", "lat"] == pytest.approx(28.37) and ub.loc["01AAN-85", "lat"] == pytest.approx(20.27)
+
+
+def test_semanas_sin_respuesta_quedan_como_huecos_y_se_completan():
+    semana = "/2019/03/"
+
+    def con_fallas(self, url, timeout=None, **kw):
+        if semana in url.split("/JSON")[0][-22:]:            # una semana de marzo de 2019 no responde
+            return cf.Resp(503, text="Service Unavailable")
+        return cf.session_get(self, url, timeout=timeout)
+
+    p1, p2, p3 = _parches()
+    with p1, p2, p3, mock.patch("datos_pml.time.sleep", lambda s: None):
+        app = nueva_app()
+        with mock.patch("requests.Session.get", con_fallas):
+            generar(app, ["06MTP-115"])
+        assert "días sin respuesta del CENACE" in textos(app)
+        assert any("consultas al CENACE con error" in e.label for e in app.expander)
+        assert periodo_mostrado(app)[0] == dp.INICIO_MTR
+        cf.LLAMADAS["cenace"] = 0
+        boton(app, "btn_todo").click()
+        app.run()
+        sin_errores(app)
+        assert 1 <= cf.LLAMADAS["cenace"] <= 6 and "Historial parcial" not in textos(app)
+        assert not any("consultas al CENACE con error" in e.label for e in app.expander)
+        assert app.session_state["informe"]["errores"] == []

@@ -177,3 +177,25 @@ def test_excel_del_informe_y_datos_horarios():
     assert ws.max_row == 2 + len(dfs["04TST-115"]) and ws.cell(3, 3).value == pytest.approx(dfs["04TST-115"]["pml"].iloc[0])
     csv = pd.read_csv(io.BytesIO(csv_horario(dfs)))
     assert len(csv) == sum(len(x) for x in dfs.values()) and list(csv.columns)[:3] == ["clave", "fecha", "hora"]
+
+
+def test_con_el_cenace_colgado_la_descarga_respeta_el_limite():
+    import threading
+    import time
+    lento = threading.Event()
+
+    def colgado(self, url, timeout=None, **kw):
+        if "/2026/" not in url and not lento.wait(3):          # semanas viejas: no responden
+            pass
+        return cf.session_get(self, url, timeout=timeout)
+
+    ultimo = dp.ultimo_dia_mtr()
+    plan = dp.planificar({"04TST-115": [(D(2024, 1, 1), ultimo)]}, {}, ultimo)
+    rec = dp.Recolector(ultimo)
+    t0 = time.time()
+    with mock.patch("requests.Session.get", colgado):
+        errores, pendientes = dp.ejecutar(plan, rec, workers=4, espera=0, limite=time.time() + 1.0, gracia=0.5)
+    assert time.time() - t0 < 4                                 # no espera a las colgadas
+    assert pendientes and len(pendientes) + rec.consultas + len(errores) == len(plan)
+    assert all(c.fin.year == 2026 or c.ini.year == 2026 for c in plan[:rec.consultas])   # lo reciente primero
+    lento.set()

@@ -73,6 +73,8 @@ MAX_NODOS_INFORME = 30
 MAX_AGREGAR_FILTRO = MAX_NODOS_INFORME
 VENTANA_INICIAL = 365            # días que se bajan primero si el historial completo tardaría mucho
 LIMITE_AUTO = float(os.environ.get("PML_LIMITE_AUTO", 240))   # s: hasta aquí se baja todo de una vez
+TOPE_INICIAL = 150               # s: tope de la primera descarga (si el CENACE se pone lento)
+TOPE_DESCARGA = 600              # s: tope de «Un año más» / «Completar desde 2017»
 REINTENTO_COLA = 3 * 3600        # los días aún no publicados se vuelven a pedir cada 3 h
 SEG_POR_CONSULTA = 2.0           # estimación inicial (segundos por consulta y por hilo)
 MONEDAS = {"MXN": "🇲🇽 MXN (pesos)", "USD": "🇺🇸 USD (dólares)"}
@@ -321,9 +323,13 @@ def faltantes_para(claves, modo, ultimo):
         cob = s.cobertura if s else []
         if modo == "inicial":       # con historial guardado ya cargado solo faltan los días nuevos
             ini = dp.INICIO_MTR if (s is not None and s.remoto) else ultimo - timedelta(days=VENTANA_INICIAL - 1)
-        elif modo == "anio":
-            primero = min((a for a, _ in cob), default=ultimo)
+        elif modo == "anio":                     # el año anterior a lo que ya está cargado
+            primero = min((a for a, _ in cob), default=ultimo + timedelta(days=1))
             ini = max(dp.INICIO_MTR, primero - timedelta(days=365))
+            rangos = dp.restar(ini, primero - timedelta(days=1), cob)
+            if rangos:
+                out[c] = rangos
+            continue
         else:
             ini = dp.INICIO_MTR
         rangos = dp.restar(ini, ultimo, cob)
@@ -349,10 +355,14 @@ def estimar(faltantes, catalogo):
     return n, n * ritmo_cenace()["seg"] / WORKERS
 
 
-def descargar(faltantes, catalogo, texto):
-    """Descarga los faltantes con barra de avance y los guarda en el almacén en memoria."""
+def descargar(faltantes, catalogo, texto, tope=TOPE_DESCARGA):
+    """Descarga los faltantes con barra de avance y los guarda en el almacén en memoria.
+
+    Las semanas más recientes van primero; pasado `tope` segundos no se lanzan consultas
+    nuevas (si el CENACE se pone lento, el informe sale con lo reciente y se completa luego).
+    """
     if not faltantes:
-        return {"consultas": 0, "errores": [], "segundos": 0.0}
+        return {"consultas": 0, "errores": [], "segundos": 0.0, "pendientes": 0}
     ultimo = dp.ultimo_dia_mtr()
     sistemas = {c: (catalogo.get(c, {}).get("sistema") or "SIN").upper() for c in faltantes}
     consultas = dp.planificar(faltantes, sistemas, ultimo)
@@ -376,7 +386,8 @@ def descargar(faltantes, catalogo, texto):
                                             f"faltan ~{_duracion(resta)}")
 
     try:
-        errores, _ = dp.ejecutar(consultas, al_llegar, workers=WORKERS, progreso=progreso)
+        errores, pendientes = dp.ejecutar(consultas, al_llegar, workers=WORKERS, progreso=progreso,
+                                          limite=t0 + tope)
     finally:
         volcar()
         for c, rangos in faltantes.items():
@@ -384,9 +395,15 @@ def descargar(faltantes, catalogo, texto):
                 alm.marcar_intento_cola(c)
     barra.empty()
     seg = time.time() - t0
-    if len(consultas) >= 2 * WORKERS:                     # con pocas consultas la estimación no sirve
-        ritmo_cenace()["seg"] = max(0.2, seg * WORKERS / len(consultas))
-    return {"consultas": len(consultas), "errores": errores, "segundos": seg}
+    hechas = len(consultas) - len(pendientes)
+    if hechas >= 2 * WORKERS:                             # con pocas consultas la estimación no sirve
+        ritmo_cenace()["seg"] = max(0.2, seg * WORKERS / hechas)
+    return {"consultas": hechas, "errores": errores, "segundos": seg, "pendientes": len(pendientes)}
+
+
+def tabla_errores(errores):
+    return pd.DataFrame([{"Semana": f"{e['ini']:%d-%m-%Y} → {e['fin']:%d-%m-%Y}", "Nodos": ", ".join(e["nodos"]),
+                          "Error": e["error"]} for e in errores])
 
 
 def generar_informe(claves, catalogo, modo="inicial"):
@@ -404,13 +421,24 @@ def generar_informe(claves, catalogo, modo="inicial"):
         n = len(falt)
         que = "el historial completo" if falt == completo else "los últimos 12 meses"
         texto = f"Descargando {que} de {n} nodo{'s' if n > 1 else ''} del CENACE"
-    res = descargar(falt, catalogo, texto)
+    res = descargar(falt, catalogo, texto, tope=TOPE_INICIAL if modo == "inicial" else TOPE_DESCARGA)
+    if res["pendientes"]:
+        avisos.append(f"El CENACE respondió lento y quedaron {res['pendientes']} consultas sin hacer (las semanas "
+                      f"más antiguas). El informe usa lo descargado; los botones de historial completan el resto.")
     previo = st.session_state.get("informe") or {}
-    errores = [{"Semana": f"{e['consulta'].ini:%d-%m-%Y} → {e['consulta'].fin:%d-%m-%Y}",
-                "Nodos": ", ".join(e["consulta"].nodos), "Error": e["error"]} for e in res["errores"]]
+    alm = almacen()
+    errores = [{"ini": e["consulta"].ini, "fin": e["consulta"].fin, "nodos": list(e["consulta"].nodos),
+                "error": e["error"]} for e in res["errores"]]
+    if modo != "inicial" and previo.get("nodos") == list(claves):
+        # Las semanas que fallaron antes y siguen sin datos se conservan; las ya cubiertas, no
+        vistos = {(e["ini"], e["fin"], tuple(e["nodos"])) for e in errores}
+        errores += [e for e in previo.get("errores", [])
+                    if (e["ini"], e["fin"], tuple(e["nodos"])) not in vistos
+                    and any(dp.restar(e["ini"], e["fin"], alm.get(c).cobertura if alm.get(c) else [])
+                            for c in e["nodos"])]
     st.session_state["informe"] = {
         "nodos": list(claves), "generado": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "avisos": avisos, "errores": errores if modo == "inicial" else previo.get("errores", []) + errores,
+        "avisos": avisos, "errores": errores,
         "consultas": res["consultas"], "segundos": res["segundos"],
     }
 
@@ -459,13 +487,20 @@ def rango_disponible(claves, comun=False):
 
 
 def historial_incompleto(claves):
-    """Nodos cuyo historial cargado no llega al inicio del MTR (ni se consultó antes)."""
-    out = []
+    """{clave: texto} de los nodos con semanas sin consultar entre el inicio del MTR y lo último cargado.
+
+    Pasa si se bajaron solo los últimos 12 meses o si el CENACE no respondió algunas semanas.
+    """
+    out = {}
     for c in claves:
         s = almacen().get(c)
         cob = s.cobertura if s else []
-        if not cob or cob[0][0] > dp.INICIO_MTR:
-            out.append(c)
+        if not cob:
+            out[c] = "sin datos todavía"
+        elif cob[0][0] > dp.INICIO_MTR:
+            out[c] = f"cargado desde el {cob[0][0]:%d-%m-%Y}"
+        elif dp.restar(dp.INICIO_MTR, cob[-1][1], cob):
+            out[c] = f"{dp.dias(dp.restar(dp.INICIO_MTR, cob[-1][1], cob))} días sin respuesta del CENACE"
     return out
 
 
@@ -1048,17 +1083,14 @@ if inf:
     # Ampliar el historial de los nodos sin historial guardado
     incompletos = historial_incompleto(claves)
     if incompletos:
-        a_, _ = rango_disponible(incompletos)
-        n_todo, s_todo = estimar(faltantes_para(incompletos, "todo", dp.ultimo_dia_mtr()), catalogo)
-        n_anio, s_anio = estimar(faltantes_para(incompletos, "anio", dp.ultimo_dia_mtr()), catalogo)
+        n_todo, s_todo = estimar(faltantes_para(list(incompletos), "todo", dp.ultimo_dia_mtr()), catalogo)
+        n_anio, s_anio = estimar(faltantes_para(list(incompletos), "anio", dp.ultimo_dia_mtr()), catalogo)
         with st.container(border=True):
-            st.markdown(f"⏳ **Historial parcial** de {', '.join(incompletos)}: cargado desde el "
-                        f"{a_:%d-%m-%Y} (el CENACE estaba lento o faltaron semanas)." if a_ else
-                        f"⏳ **Sin datos todavía** de {', '.join(incompletos)}.")
+            st.markdown("⏳ **Historial parcial:** " + "; ".join(f"{c} {t}" for c, t in incompletos.items()) + ".")
             c1, c2, c3 = st.columns([1, 1, 2])
             mas_anio = c1.button(f"⏪ Un año más (~{_duracion(s_anio)})", key="btn_anio", width="stretch",
                                  disabled=n_anio == 0)
-            todo = c2.button(f"⏮ Todo desde 2017 (~{_duracion(s_todo)})", key="btn_todo", width="stretch",
+            todo = c2.button(f"⏮ Completar desde 2017 (~{_duracion(s_todo)})", key="btn_todo", width="stretch",
                              disabled=n_todo == 0)
             c3.caption(f"{n_todo} consultas al CENACE para el historial completo. Lo descargado queda en "
                        f"memoria mientras la app está despierta; para guardarlo siempre, agrega el nodo a "
@@ -1073,7 +1105,7 @@ if inf:
         st.error("El CENACE no devolvió datos de estos nodos (¿nodo nuevo, de otro sistema o sin MTR "
                  "publicado aún?).")
         if inf.get("errores"):
-            st.dataframe(pd.DataFrame(inf["errores"]), hide_index=True, width="stretch")
+            st.dataframe(tabla_errores(inf["errores"]), hide_index=True, width="stretch")
         st.stop()
 
     ini, fin = controles_periodo(a, b, rango_disponible(claves, comun=True) if len(claves) > 1 else (None, None))
@@ -1111,7 +1143,7 @@ if inf:
                + (f" · {fx_txt}" if fx_txt else ""))
     if inf.get("errores"):
         with st.expander(f"⚠️ {len(inf['errores'])} consultas al CENACE con error (esas semanas faltan)"):
-            st.dataframe(pd.DataFrame(inf["errores"][:200]), hide_index=True, width="stretch")
+            st.dataframe(tabla_errores(inf["errores"][:200]), hide_index=True, width="stretch")
 
     params = {"nodos": ",".join(claves), "moneda": u, "periodo": token_periodo(ini, fin, a, b)}
     if dict(st.query_params) != params:

@@ -43,7 +43,7 @@ INICIO_MTR = date(2017, 1, 27)      # inicio del MTR en SIN, BCA y BCS (manual S
 REZAGO_MTR = 7                      # el MTR del día D se publica el D+7
 DIAS_CONSULTA = 7
 NODOS_CONSULTA = 20
-TIMEOUT = 60
+TIMEOUT = (10, 45)                  # conexión, lectura (s)
 SISTEMAS = ("SIN", "BCA", "BCS")
 
 COLUMNAS = ["fecha", "hora", "pml", "pml_ene", "pml_per", "pml_cng"]
@@ -203,15 +203,21 @@ def _sesion() -> requests.Session:
 
 
 def consultar(consulta: Consulta, reintentos: int = 4, espera: float = 1.0):
-    """(datos {clave: df}, None) o (None, error). Reintenta fallas de red y 5xx."""
+    """(datos {clave: df}, None) o (None, error). Reintenta fallas de red y 5xx.
+
+    Tras una falla de red se descarta la sesión: una conexión que el servidor (o un
+    intermediario) cerró sin avisar deja colgada la siguiente consulta hasta el timeout.
+    """
     error = "sin respuesta"
     for intento in range(reintentos):
         try:
             r = _sesion().get(consulta.url(), timeout=TIMEOUT)
         except requests.RequestException as e:
             error = type(e).__name__
+            _local.sesion = None
         except Exception as e:      # noqa: BLE001 — cualquier otra falla cuenta como error de la consulta
             error = f"{type(e).__name__}: {e}"
+            _local.sesion = None
         else:
             if r.status_code == 200:
                 try:
@@ -236,11 +242,12 @@ def consultar(consulta: Consulta, reintentos: int = 4, espera: float = 1.0):
 
 
 def ejecutar(consultas, al_llegar, workers: int = 8, progreso=None, limite: float | None = None,
-             espera: float = 1.0):
+             espera: float = 1.0, gracia: float = 20.0):
     """Corre las consultas en paralelo; al_llegar(consulta, datos) en el hilo que llama.
 
-    limite: time.time() a partir del cual no se lanzan consultas nuevas.
-    Devuelve (errores [{consulta, error}], pendientes no lanzadas).
+    limite: time.time() a partir del cual no se lanzan consultas nuevas; las que siguen en
+    curso se esperan `gracia` segundos más y luego se abandonan (cuentan como pendientes).
+    Devuelve (errores [{consulta, error}], pendientes sin resultado).
     """
     errores, pendientes = [], list(consultas)
     total, hechas = len(pendientes), 0
@@ -249,12 +256,22 @@ def ejecutar(consultas, al_llegar, workers: int = 8, progreso=None, limite: floa
     en_curso = {}
     try:
         while pendientes or en_curso:
-            while pendientes and len(en_curso) < workers * 2 and (limite is None or time.time() < limite):
+            ahora = time.time()
+            lanzar = limite is None or ahora < limite
+            while pendientes and len(en_curso) < workers * 2 and lanzar:
                 c = pendientes.pop()
                 en_curso[ex.submit(consultar, c, 4, espera)] = c
             if not en_curso:
                 break
-            listos, _ = wait(list(en_curso), return_when=FIRST_COMPLETED)
+            if limite is None:
+                tope = None
+            elif lanzar:
+                tope = max(0.5, limite - ahora)          # despertar al llegar al límite
+            else:
+                tope = limite + gracia - ahora
+                if tope <= 0:
+                    break                                  # se abandonan las que siguen colgadas
+            listos, _ = wait(list(en_curso), timeout=tope, return_when=FIRST_COMPLETED)
             for fut in listos:
                 c = en_curso.pop(fut)
                 datos, error = fut.result()
@@ -268,7 +285,7 @@ def ejecutar(consultas, al_llegar, workers: int = 8, progreso=None, limite: floa
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     pendientes.reverse()
-    return errores, pendientes
+    return errores, list(en_curso.values()) + pendientes
 
 
 def cubierto(consulta: Consulta, datos: dict, clave: str, ultimo: date):
