@@ -12,16 +12,16 @@ import pytest
 import catalogo as cat
 
 RAIZ = Path(__file__).resolve().parents[1]
-NUEVA = "v2026-11-18"
+NUEVA = "v2099-01-01"   # siempre posterior a la del repositorio
 HTML = ('<a href="/Docs/01_MECP/CatalogoNodosP/2026/'
-        'Catálogo NodosP Sistema Eléctrico Nacional (v2026-11-18).xlsx">Excel</a>')
+        'Catálogo NodosP Sistema Eléctrico Nacional (v2099-01-01).xlsx">Excel</a>')
 
 
 def _catalogo_nuevo(quitar_casi_todo=False):
     """El catálogo del repo con hoja renombrada, una alta, una baja y un cambio de kV."""
     wb = openpyxl.load_workbook(RAIZ / "data" / "catalogo_nodos.xlsx")
     ws = wb[wb.sheetnames[0]]
-    ws.title = "Catalogo de NodosP V20261118"
+    ws.title = "Catalogo de NodosP V20990101"
     filas = {str(ws.cell(row=r, column=4).value): r for r in range(3, ws.max_row + 1)}
     ws.cell(row=filas["04TST-115"], column=6).value = 230
     ws.append([c.value for c in ws[filas["04EMY-115"]]])
@@ -31,7 +31,7 @@ def _catalogo_nuevo(quitar_casi_todo=False):
     if quitar_casi_todo:
         ws.delete_rows(10, ws.max_row)
     cc = wb[wb.sheetnames[1]]
-    cc.append([999, "Alta del nuevo NodoP 04NEW-115", "2026-11-18", "USO"])
+    cc.append([999, "Alta del nuevo NodoP 04NEW-115", "2099-01-01", "USO"])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -57,7 +57,7 @@ def _get_falso(contenido):
         if url == cat.URL_PAGINA_CATALOGO:
             r.text = HTML
         else:
-            assert url.endswith("(v2026-11-18).xlsx") and "%20" in url
+            assert url.endswith(f"({NUEVA}).xlsx") and "%20" in url
             r.content = contenido
         return r
     return get

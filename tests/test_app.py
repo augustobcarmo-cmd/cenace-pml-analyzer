@@ -128,7 +128,9 @@ def _textos(at):
 def test_portada_sin_bess(app):
     assert not app.exception
     assert "PML CENACE" in _textos(app)
-    assert "v2026-07-16" in _textos(app)
+    from catalogo import parse_catalogo
+    version = parse_catalogo(Path(APP).parent / "data" / "catalogo_nodos.xlsx")[1]
+    assert version and version in _textos(app)
     assert _radio(app, "Selecciona qué hacer:").options == ["🔬 Análisis", "📊 Datos"]
     assert not re.search(r"bess|kmz|scoring", _textos(app), re.I)
 
