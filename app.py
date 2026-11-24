@@ -174,13 +174,28 @@ OSM_HEADERS = {
 # ═══════════════════════════════════════════════════════════════════════
 # CARGAR CATÁLOGO (cached)
 # ═══════════════════════════════════════════════════════════════════════
-@st.cache_data
+def _firma_archivo(ruta):
+    """(mtime, tamaño) del archivo, para que la caché se renueve cuando cambia
+    (p. ej. cuando la GitHub Action sube un catálogo nuevo sin reiniciar la app)."""
+    try:
+        st_ = os.stat(ruta)
+        return (st_.st_mtime_ns, st_.st_size)
+    except OSError:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _cargar_catalogo_archivo(ruta, firma):
+    return parse_catalogo(ruta)
+
+
 def cargar_catalogo_default():
     """Carga el catálogo del repo (default). Retorna (catalogo, version)."""
     catalog_path = os.path.join(os.path.dirname(__file__), 'data', 'catalogo_nodos.xlsx')
-    if not os.path.exists(catalog_path):
+    firma = _firma_archivo(catalog_path)
+    if firma is None:
         return {}, ""
-    return parse_catalogo(catalog_path)
+    return _cargar_catalogo_archivo(catalog_path, firma)
 
 
 def cargar_catalogo_uploaded(file_bytes):
@@ -2217,15 +2232,21 @@ def catalogo_df(llave, _catalogo):
     return df.rename(columns={"index": "clave"})
 
 
-def _leer_json_data(nombre):
+@st.cache_data(show_spinner=False)
+def _leer_json_archivo(ruta, firma):
     try:
-        with open(os.path.join(RUTA_DATA, nombre), encoding="utf-8") as fh:
+        with open(ruta, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return {}
 
 
-@st.cache_data(show_spinner=False)
+def _leer_json_data(nombre):
+    ruta = os.path.join(RUTA_DATA, nombre)
+    firma = _firma_archivo(ruta)
+    return _leer_json_archivo(ruta, firma) if firma else {}
+
+
 def cargar_listas_guardadas():
     """{nombre: [claves]} desde data/listas_nodos.json."""
     datos = _leer_json_data("listas_nodos.json")
@@ -2233,7 +2254,6 @@ def cargar_listas_guardadas():
             for k, v in datos.items() if isinstance(v, list)}
 
 
-@st.cache_data(show_spinner=False)
 def cargar_novedades_catalogo():
     """Diferencias de la última versión del catálogo (data/catalogo_cambios.json)."""
     return _leer_json_data("catalogo_cambios.json")
