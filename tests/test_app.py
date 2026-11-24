@@ -116,22 +116,33 @@ def test_ficha_de_nodo_guardado_sale_sin_consultar_al_cenace(app):
     assert not any(b.key in ("btn_anio", "btn_todo") for b in app.button)
 
 
-def test_nodo_sin_historial_baja_12_meses_y_luego_todo(app):
+def test_nodo_sin_historial_baja_todo_el_historial(app):
     generar(app, ["06MTP-115"])
     ultimo = dp.ultimo_dia_mtr()
-    assert cf.LLAMADAS["cenace"] == len(dp.bloques(ultimo - timedelta(days=364), ultimo, ultimo))
-    d0, d1 = periodo_mostrado(app)
-    assert d1 == ultimo and timedelta(days=364) <= d1 - d0 <= timedelta(days=371)
-    assert "Historial parcial" in textos(app)
-    cf.LLAMADAS["cenace"] = 0
-    boton(app, "btn_todo").click()
-    app.run()
-    sin_errores(app)
+    assert cf.LLAMADAS["cenace"] == len(dp.bloques(dp.INICIO_MTR, ultimo, ultimo))
     assert periodo_mostrado(app) == (dp.INICIO_MTR, ultimo)
-    assert cf.LLAMADAS["cenace"] == len(dp.bloques(dp.INICIO_MTR, d0 - timedelta(days=1), ultimo))
-    assert not any(b.key in ("btn_anio", "btn_todo") for b in app.button)
+    assert "Historial parcial" not in textos(app)
     esperado = cf.pml_esperado("06MTP-115", dp.INICIO_MTR, ultimo)
     assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)
+
+
+def test_con_el_cenace_lento_baja_12_meses_y_luego_completa():
+    p1, p2, p3 = _parches()
+    with p1, p2, p3, mock.patch.dict("os.environ", {"PML_LIMITE_AUTO": "0"}):
+        app = nueva_app()
+        generar(app, ["06MTP-115"])
+        ultimo = dp.ultimo_dia_mtr()
+        assert cf.LLAMADAS["cenace"] == len(dp.bloques(ultimo - timedelta(days=364), ultimo, ultimo))
+        d0, d1 = periodo_mostrado(app)
+        assert d1 == ultimo and timedelta(days=364) <= d1 - d0 <= timedelta(days=371)
+        assert "Historial parcial" in textos(app)
+        cf.LLAMADAS["cenace"] = 0
+        boton(app, "btn_todo").click()
+        app.run()
+        sin_errores(app)
+        assert periodo_mostrado(app) == (dp.INICIO_MTR, ultimo)
+        assert cf.LLAMADAS["cenace"] == len(dp.bloques(dp.INICIO_MTR, d0 - timedelta(days=1), ultimo))
+        assert not any(b.key in ("btn_anio", "btn_todo") for b in app.button)
 
 
 def test_comparacion_periodo_comun_y_ficha_de_cada_nodo(app):
@@ -140,13 +151,15 @@ def test_comparacion_periodo_comun_y_ficha_de_cada_nodo(app):
                                                   "Monterrey Potencia (06MTP-115)"]
     tabla = next(d.value for d in app.dataframe if "solar_factor" in d.value.columns)
     assert list(tabla.index) == NODOS
-    assert "Ojo con los períodos" in textos(app)
+    assert app.radio(key="periodo_modo").value == "comun"       # historias distintas: se compara a la par
+    app.radio(key="periodo_modo").set_value("todo")
+    app.run()
+    assert "Ojo con los períodos" in textos(app) and "(tramo común)" in textos(app)
     app.radio(key="periodo_modo").set_value("comun")
     app.run()
     sin_errores(app)
     ultimo = dp.ultimo_dia_mtr()
-    inicio_mtp = dp.bloques(ultimo - timedelta(days=364), ultimo, ultimo)[0][0]   # 12 meses descargados
-    assert periodo_mostrado(app) == (max(cf.INICIO_NODO["04EMY-115"], inicio_mtp), ultimo)
+    assert periodo_mostrado(app) == (cf.INICIO_NODO["04EMY-115"], ultimo)
     assert "Ojo con los períodos" not in textos(app)
     app.selectbox(key="ref_sel").set_value("06MTP-115")
     app.run()
@@ -154,8 +167,8 @@ def test_comparacion_periodo_comun_y_ficha_de_cada_nodo(app):
     app.radio(key="vista_sel").set_value("04EMY-115")
     app.run()
     sin_errores(app)
-    esperado = cf.pml_esperado("04EMY-115", max(cf.INICIO_NODO["04EMY-115"], inicio_mtp), ultimo)
-    assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)   # período común
+    esperado = cf.pml_esperado("04EMY-115", cf.INICIO_NODO["04EMY-115"], ultimo)
+    assert metrica(app, "PML promedio (MXN/MWh)") == pytest.approx(esperado, abs=0.6)
 
 
 def _usd_en_periodo(at, d0, d1):

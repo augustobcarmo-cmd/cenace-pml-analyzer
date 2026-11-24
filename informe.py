@@ -279,8 +279,8 @@ def lecturas(f: dict, unidad: str = "MXN") -> list[str]:
                        "zona importadora: la energía llega de lejos o con restricciones de entrada")
             pct = dif / k["energia"] * 100 if k["energia"] else np.nan
             out.append(f"**Red.** El nodo cotiza **{_n(abs(dif), 1)} {u} {lado}** del componente de energía "
-                       f"del sistema ({_n(pct, 1)} %; pérdidas {_n(per, 1)}, congestión {_n(cng, 1)}): "
-                       f"señal de {lectura}.")
+                       f"del sistema ({_n(pct, 1)} %; pérdidas {_n(per, 1)} y congestión {_n(cng, 1)}). "
+                       f"Es señal de {lectura}.")
 
     pct_cng = k["pct_cng"]
     if not np.isnan(pct_cng):
@@ -294,10 +294,7 @@ def lecturas(f: dict, unidad: str = "MXN") -> list[str]:
                      if k["pct_cng_pos"] > 2 * k["pct_cng_neg"] else "en ambos sentidos")
             texto = (f"**Congestión {frec}:** {_n(pct_cng, 1)} % de las horas, {signo}; cuando aparece "
                      f"mueve el precio {_n(k['cng_cuando'], 1)} {u} en promedio.")
-            h = f["horario"]["congestion"]
-            fuertes = h[h.abs() >= max(abs(h).max() * 0.5, umbral_horas(prom))].index
-            if len(fuertes) and len(fuertes) < 24:
-                texto += f" Se concentra en las {_rango_horas(fuertes)}."
+            texto += _cuando(f["horario"]["congestion"].abs(), "Se concentra")
             a, b = k.get("pct_cng_12m", np.nan), k.get("pct_cng_12m_prev", np.nan)
             if not np.isnan(a) and not np.isnan(b) and abs(a - b) >= 5:
                 texto += (f" Va {'en aumento' if a > b else 'a la baja'}: {_n(a, 0)} % de las horas en los "
@@ -305,11 +302,8 @@ def lecturas(f: dict, unidad: str = "MXN") -> list[str]:
             out.append(texto)
 
     if k["pct_neg"] >= 0.5:
-        h = f["horario"]["pct_neg"]
-        horas_neg = h[h >= max(h.max() * 0.5, 1)].index
-        out.append(f"**Precios negativos** en {_n(k['pct_neg'], 1)} % de las horas"
-                   + (f", sobre todo a las {_rango_horas(horas_neg)}" if len(horas_neg) else "")
-                   + ": riesgo de vertimiento o de vender a pérdida en esas horas.")
+        out.append(f"**Precios negativos** en {_n(k['pct_neg'], 1)} % de las horas: riesgo de vertimiento o "
+                   f"de vender a pérdida." + _cuando(f["horario"]["pct_neg"], "Se concentran"))
 
     h = f["horario"]["promedio"].dropna()
     if len(h) >= 20:
@@ -358,9 +352,15 @@ def lecturas(f: dict, unidad: str = "MXN") -> list[str]:
     return out
 
 
-def umbral_horas(prom: float) -> float:
-    """Congestión horaria promedio mínima para decir que «se concentra» en esa hora."""
-    return max(abs(prom) * 0.01, 1e-9)
+def _cuando(por_hora: pd.Series, verbo: str) -> str:
+    """« Se concentra a las 10-16 h.» o, si abarca casi todo el día, sus 4 horas más fuertes."""
+    h = por_hora.dropna()
+    if h.empty or h.max() <= 0:
+        return ""
+    fuertes = h[h >= 0.5 * h.max()].index
+    if len(fuertes) <= 12:
+        return f" {verbo} a las {_rango_horas(fuertes)}."
+    return f" Aparece casi todo el día; es más fuerte a las {_rango_horas(h.nlargest(4).index)}."
 
 
 # ─── Comparación entre nodos ─────────────────────────────────────────────
@@ -407,11 +407,19 @@ def comparacion(dfs: dict, fichas: dict, nombres: dict, ref: str, unidad: str = 
     diarios = pd.DataFrame({c: fichas[c]["diario"].set_index("fecha")["promedio"] for c in claves})
     correlacion = diarios.corr(min_periods=30)
 
+    # Promedio de cada nodo en el tramo que todos comparten (para comparar a la par)
+    a, b = max(tabla["desde"]), min(tabla["hasta"])
+    comun = (a, b) if a < b else None
+    if comun:
+        ta, tb = pd.Timestamp(a), pd.Timestamp(b)
+        tabla["prom_comun"] = [float(dfs[c].loc[(dfs[c]["fecha"] >= ta) & (dfs[c]["fecha"] <= tb), "pml"].mean())
+                               for c in tabla.index]
+
     comp = {
         "vacio": False, "ref": ref, "claves": claves, "tabla": tabla, "mensual": mensual,
         "horario": horario, "horario_cng": horario_cng, "horario_dif": horario_dif,
         "dif_ref": pd.DataFrame(difs).T, "dif_mensual": pd.DataFrame(dif_mensual),
-        "dif_horario": pd.DataFrame(dif_horario).reindex(HORAS), "correlacion": correlacion,
+        "dif_horario": pd.DataFrame(dif_horario).reindex(HORAS), "correlacion": correlacion, "comun": comun,
     }
     comp["lecturas"] = lecturas_comparacion(comp, nombres, unidad)
     return comp
@@ -422,14 +430,19 @@ def lecturas_comparacion(comp: dict, nombres: dict, unidad: str = "MXN") -> list
     u = f"{unidad}/MWh"
     nom = lambda c: f"{nombres.get(c, c)} ({c})"          # noqa: E731
     out = []
-    prom = t["promedio"].dropna()
+    desde = t["desde"].dropna()
+    distintos = len(desde) > 1 and (max(desde) - min(desde)).days > 31
+    comun = comp.get("comun")
+    if distintos and comun and "prom_comun" in t:
+        prom, cuando = t["prom_comun"].dropna(), f" entre {comun[0]:%d-%m-%Y} y {comun[1]:%d-%m-%Y} (tramo común)"
+    else:
+        prom, cuando = t["promedio"].dropna(), ""
     if len(prom) >= 2:
         alto, bajo = prom.idxmax(), prom.idxmin()
-        out.append(f"**Precio.** El más caro en promedio es {nom(alto)} con {_n(prom[alto])} {u}; el más barato, "
-                   f"{nom(bajo)} con {_n(prom[bajo])} {u} ({_n((prom[alto] / prom[bajo] - 1) * 100, 1)} % de "
-                   f"diferencia en sus períodos).")
-    desde = t["desde"].dropna()
-    if len(desde) and desde.nunique() > 1:
+        out.append(f"**Precio{cuando}.** El más caro en promedio es {nom(alto)} con {_n(prom[alto])} {u}; el más "
+                   f"barato, {nom(bajo)} con {_n(prom[bajo])} {u} ({_n((prom[alto] / prom[bajo] - 1) * 100, 1)} % "
+                   f"de diferencia).")
+    if distintos:
         out.append("**Ojo con los períodos:** los nodos no tienen la misma historia ("
                    + "; ".join(f"{c} desde {desde[c]:%m-%Y}" for c in desde.index)
                    + "). Los promedios de los nodos más nuevos no cubren los mismos años: "
@@ -455,8 +468,11 @@ def lecturas_comparacion(comp: dict, nombres: dict, unidad: str = "MXN") -> list
     corr = comp["correlacion"]
     if corr.shape[0] >= 2:
         m = corr.where(~np.eye(len(corr), dtype=bool)).stack().dropna()
-        if len(m):
+        if len(m) and m.min() < 0.95:
             a, b = m.idxmin()
             out.append(f"**Correlación diaria.** El par menos correlacionado es {a} / {b} "
                        f"(r = {m.min():.2f}): ahí está el mayor riesgo de base entre nodos.")
+        elif len(m):
+            out.append(f"**Correlación diaria.** Los promedios diarios se mueven juntos (r ≥ {m.min():.2f} en todos "
+                       f"los pares): la diferencia entre nodos está en las horas, no en el nivel del día.")
     return out

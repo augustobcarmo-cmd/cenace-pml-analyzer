@@ -71,7 +71,8 @@ st.markdown(f"""
 WORKERS = 8
 MAX_NODOS_INFORME = 30
 MAX_AGREGAR_FILTRO = MAX_NODOS_INFORME
-VENTANA_INICIAL = 365            # días que se descargan de un nodo sin historial guardado
+VENTANA_INICIAL = 365            # días que se bajan primero si el historial completo tardaría mucho
+LIMITE_AUTO = float(os.environ.get("PML_LIMITE_AUTO", 240))   # s: hasta aquí se baja todo de una vez
 REINTENTO_COLA = 3 * 3600        # los días aún no publicados se vuelven a pedir cada 3 h
 SEG_POR_CONSULTA = 2.0           # estimación inicial (segundos por consulta y por hilo)
 MONEDAS = {"MXN": "🇲🇽 MXN (pesos)", "USD": "🇺🇸 USD (dólares)"}
@@ -272,6 +273,12 @@ def almacen():
     return dp.Almacen(max_series=60)
 
 
+@st.cache_resource(show_spinner=False)
+def ritmo_cenace():
+    """Segundos por consulta y por hilo medidos en la última descarga (todas las sesiones)."""
+    return {"seg": SEG_POR_CONSULTA}
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def _indice_remoto():
     return dp.leer_indice_remoto()
@@ -339,7 +346,7 @@ def estimar(faltantes, catalogo):
         return 0, 0.0
     sistemas = {c: (catalogo.get(c, {}).get("sistema") or "SIN").upper() for c in faltantes}
     n = len(dp.planificar(faltantes, sistemas, dp.ultimo_dia_mtr()))
-    return n, n * st.session_state.get("seg_por_consulta", SEG_POR_CONSULTA) / WORKERS
+    return n, n * ritmo_cenace()["seg"] / WORKERS
 
 
 def descargar(faltantes, catalogo, texto):
@@ -378,7 +385,7 @@ def descargar(faltantes, catalogo, texto):
     barra.empty()
     seg = time.time() - t0
     if len(consultas) >= 2 * WORKERS:                     # con pocas consultas la estimación no sirve
-        st.session_state["seg_por_consulta"] = max(0.2, seg * WORKERS / len(consultas))
+        ritmo_cenace()["seg"] = max(0.2, seg * WORKERS / len(consultas))
     return {"consultas": len(consultas), "errores": errores, "segundos": seg}
 
 
@@ -386,9 +393,17 @@ def generar_informe(claves, catalogo, modo="inicial"):
     """Junta los datos del informe (historial guardado + descargas) y lo deja en sesión."""
     with st.spinner("Leyendo el historial guardado…"):
         avisos = cargar_guardados(claves)
-    falt = faltantes_para(claves, modo, dp.ultimo_dia_mtr())
-    texto = ("Completando el historial" if modo != "inicial" else
-             f"Descargando {len(falt)} nodo{'s' if len(falt) > 1 else ''} del CENACE")
+    ultimo = dp.ultimo_dia_mtr()
+    falt = faltantes_para(claves, modo, ultimo)
+    texto = "Completando el historial"
+    if modo == "inicial":
+        # Todo el historial de una vez si el CENACE responde a buen ritmo; si no, 12 meses primero
+        completo = faltantes_para(claves, "todo", ultimo)
+        if estimar(completo, catalogo)[1] <= LIMITE_AUTO:
+            falt = completo
+        n = len(falt)
+        que = "el historial completo" if falt == completo else "los últimos 12 meses"
+        texto = f"Descargando {que} de {n} nodo{'s' if n > 1 else ''} del CENACE"
     res = descargar(falt, catalogo, texto)
     previo = st.session_state.get("informe") or {}
     errores = [{"Semana": f"{e['consulta'].ini:%d-%m-%Y} → {e['consulta'].fin:%d-%m-%Y}",
@@ -960,11 +975,18 @@ with st.sidebar:
 
 
 # ─── Generar (botón o enlace) ───
+def periodo_por_defecto(claves):
+    """Todo el historial; en comparaciones de nodos con historias distintas, el período común."""
+    a, _ = rango_disponible(claves)
+    c, _ = rango_disponible(claves, comun=True) if len(claves) > 1 else (None, None)
+    return "comun" if a and c and (c - a).days > 31 else "todo"
+
+
 desde_enlace = st.session_state.pop("_autogenerar", False)
 if (generar or desde_enlace) and sel and not demasiados:
     generar_informe(sel, catalogo)
-    if generar:
-        st.session_state["periodo_modo"] = "todo"
+    if generar or "periodo_modo" not in st.session_state:
+        st.session_state["periodo_modo"] = periodo_por_defecto(sel)
     st.session_state.pop("vista_sel", None)
 
 inf = st.session_state.get("informe")
@@ -998,9 +1020,10 @@ if not inf or set(sel) != set(nodos_informe):
         if guardados:
             st.markdown("💾 **Historial guardado** (informe inmediato, se actualiza a diario): "
                         + ", ".join(f"{nombre_nodo(c, catalogo)} ({c})" for c in guardados))
-        st.caption(f"Los demás nodos se descargan del CENACE al pedirlos: primero los últimos 12 meses "
-                   f"(~1 min) y, si quieres, el resto del historial (MTR desde el {dp.INICIO_MTR:%d-%m-%Y}). "
-                   f"Quedan en memoria mientras la app está despierta.")
+        st.caption(f"Los demás nodos se descargan del CENACE al pedirlos: todo el historial (MTR desde el "
+                   f"{dp.INICIO_MTR:%d-%m-%Y}) suele tardar 1-3 min; si el CENACE está lento, primero los "
+                   f"últimos 12 meses y un botón completa el resto. Quedan en memoria mientras la app está "
+                   f"despierta.")
 
 # ─── Informe ───
 if inf:
@@ -1030,7 +1053,8 @@ if inf:
         n_anio, s_anio = estimar(faltantes_para(incompletos, "anio", dp.ultimo_dia_mtr()), catalogo)
         with st.container(border=True):
             st.markdown(f"⏳ **Historial parcial** de {', '.join(incompletos)}: cargado desde el "
-                        f"{a_:%d-%m-%Y}." if a_ else f"⏳ **Sin datos todavía** de {', '.join(incompletos)}.")
+                        f"{a_:%d-%m-%Y} (el CENACE estaba lento o faltaron semanas)." if a_ else
+                        f"⏳ **Sin datos todavía** de {', '.join(incompletos)}.")
             c1, c2, c3 = st.columns([1, 1, 2])
             mas_anio = c1.button(f"⏪ Un año más (~{_duracion(s_anio)})", key="btn_anio", width="stretch",
                                  disabled=n_anio == 0)
@@ -1041,7 +1065,7 @@ if inf:
                        f"una lista guardada.")
         if mas_anio or todo:
             generar_informe(claves, catalogo, modo="anio" if mas_anio else "todo")
-            st.session_state["periodo_modo"] = "todo"
+            st.session_state["periodo_modo"] = periodo_por_defecto(claves)
             st.rerun()
 
     a, b = rango_disponible(claves)

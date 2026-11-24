@@ -39,10 +39,10 @@ Convenciones (también en la portada del Excel):
 
 ## Historial completo: guardado y bajo demanda
 
-El SW-PML entrega como máximo 7 días y 20 nodos por consulta, y el MTR existe desde el 27-ene-2017: el historial de un nodo son unas 510 consultas. Para no repetir ese trabajo:
+El SW-PML entrega como máximo 7 días y 20 nodos por consulta, y el MTR existe desde el 27-ene-2017: el historial de un nodo son unas 510 consultas (hasta 20 nodos comparten las mismas consultas). Para no repetir ese trabajo:
 
 - **Nodos de las listas guardadas** (`data/listas_nodos.json`): la GitHub Action `Actualizar historial de PML (MTR)` guarda todo su historial en la rama **`datos`** (un Parquet por nodo e `indice.json`) y suma los días nuevos dos veces al día. Su informe sale de inmediato, con todo el historial. En el buscador llevan 💾.
-- **Cualquier otro nodo:** el primer informe descarga los últimos 12 meses (~1 min). Los botones **⏪ Un año más** y **⏮ Todo desde 2017** completan el historial con una estimación de tiempo. Lo descargado queda en memoria y lo comparten todas las sesiones mientras la app está despierta; Streamlit Cloud borra la memoria cuando la app se duerme.
+- **Cualquier otro nodo:** el primer informe descarga todo su historial del CENACE (unas 460-510 consultas en paralelo; ~1-2 min medidos el 24-nov-2026 desde Streamlit Cloud). Si la estimación pasa de 4 minutos (CENACE lento o muchos nodos), baja primero los últimos 12 meses y los botones **⏪ Un año más** y **⏮ Todo desde 2017** completan el resto. Lo descargado queda en memoria y lo comparten todas las sesiones mientras la app está despierta; Streamlit Cloud borra la memoria cuando la app se duerme.
 - Para guardar un nodo para siempre, agrégalo a una lista en `data/listas_nodos.json`: el push dispara la Action, que descarga su historial completo.
 
 La rama `datos` se publica como un único commit sin historial, así el repositorio no crece. La Action se puede correr a mano en *Actions → Actualizar historial de PML (MTR) → Run workflow*, con claves extra opcionales.
