@@ -1,0 +1,63 @@
+{
+ "version": 1,
+ "proceso": "MTR",
+ "actualizado": "2026-11-28T04:55:11Z",
+ "ultimo_dia_esperado": "2026-11-21",
+ "catalogo": "v2026-11-18",
+ "fuente": "CENACE, servicio web SW-PML (MTR)",
+ "nodos": {
+  "04EMY-115": {
+   "sistema": "SIN",
+   "nombre": "El Mayo",
+   "cobertura": [
+    [
+     "2017-01-27",
+     "2026-11-21"
+    ]
+   ],
+   "filas": 8040,
+   "desde": "2025-12-22",
+   "hasta": "2026-11-21",
+   "dias_con_datos": 335,
+   "archivo": "MTR/04EMY-115.parquet",
+   "bytes": 148293,
+   "actualizado": "2026-11-28T04:55:11Z"
+  },
+  "04MTS-115": {
+   "sistema": "SIN",
+   "nombre": "Maniobras Tastiota",
+   "cobertura": [
+    [
+     "2017-01-27",
+     "2026-11-21"
+    ]
+   ],
+   "filas": 31464,
+   "desde": "2023-04-21",
+   "hasta": "2026-11-21",
+   "dias_con_datos": 1311,
+   "archivo": "MTR/04MTS-115.parquet",
+   "bytes": 542382,
+   "actualizado": "2026-11-28T04:55:11Z"
+  },
+  "04TST-115": {
+   "sistema": "SIN",
+   "nombre": "Tastiota",
+   "cobertura": [
+    [
+     "2017-01-27",
+     "2026-11-21"
+    ]
+   ],
+   "filas": 86064,
+   "desde": "2017-01-27",
+   "hasta": "2026-11-21",
+   "dias_con_datos": 3586,
+   "archivo": "MTR/04TST-115.parquet",
+   "bytes": 1428672,
+   "actualizado": "2026-11-28T04:55:11Z"
+  }
+ },
+ "errores_ultima_corrida": [],
+ "consultas_pendientes": 0
+}
